@@ -246,72 +246,6 @@ function assignmap_to_conclist(image, ntiles, assignmap, concfun)
     return concarray
 end
 
-using ProgressMeter
-
-function pattern_match(tiletypes, usecodes, locmaps, images, params, concfun, boredmax;
-                       initassign::Union{Nothing, Array{Int64,2}}=nothing, trialsperpoint=30,
-                       depth=10, sn=1)
-    allowedtiles = findall(x -> x in usecodes, tiletypes).-1
-    if length(allowedtiles) > length(images[1])
-        println("Oh dear")
-    end
-    if initassign == nothing
-        assignmap = fill(-1, size(images[1]))
-        initplaces = sample(CartesianIndices(assignmap), length(allowedtiles), replace=false)
-        for i in eachindex(initplaces)
-            assignmap[initplaces[i]] = allowedtiles[i]
-        end
-    else
-        assignmap = initassign::Array{Int64,2}
-    end
-    
-    allplaceindices = CartesianIndices(assignmap)
-    ntiles = length(tiletypes)
-    
-    function do_meas(am)
-        cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)),
-                   eachindex(images) )
-        return @distributed (max) for (i,cl) = cls
-            gces = pmap(locmaps) do lm
-                return probabilistic_gce(concs_to_array(lm, cl), depth, trialsperpoint,
-                                         params)[1]
-            end
-            return gces[i]-minimum(gces[1:length(gces) .!= i])
-        end
-    end
-
-    pr = Progress(boredmax, 1)
-    bored = 0
-    minmeas = do_meas(assignmap)
-    println("Starting value: $minmeas")
-    while bored < boredmax
-        swap = sample(allplaceindices, 2*sn, replace=false)
-
-        if all(assignmap[swap[1:sn]].==-1) && all(assignmap[swap[(sn+1):end]].==-1)
-            continue
-        end
-
-        assignmap[swap[1:sn]], assignmap[swap[(sn+1):end]] = assignmap[swap[(sn+1):end]], assignmap[swap[1:sn]]
-
-        meas = do_meas(assignmap)
-        if meas < minmeas
-            minmeas = meas
-            println(assignmap)
-            println("New value: $meas | b=$bored / $boredmax")
-            flush(stdout)
-            bored = 0
-            pr = Progress(boredmax, 1)
-        else
-            assignmap[swap[1:sn]], assignmap[swap[(sn+1):end]] = assignmap[swap[(sn+1):end]], assignmap[swap[1:sn]]
-            bored += 1
-        end
-        update!(pr, bored)
-    end
-    return assignmap, minmeas
-    
-end
-
-
 using .TinyClimbers
 
 function pm_meas(am, images, ntiles, concfun, locmaps, depth, trialsperpoint, params)
@@ -334,20 +268,6 @@ function pm_meas(am, images, ntiles, concfun, locmaps, depth, trialsperpoint, pa
     #end
 end
 
-function pm_meas_window_k2(am, images, ntiles, concfun, locmaps, kval)
-    cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)), eachindex(images) )
-    function nfn(x)
-        i, cl = x
-        cas = [concs_to_array(lm, cl) for lm in locmaps]
-        wvals = log.(sum(sum(sum(exp.(k^2*log.(imfilter(ca, centered(ones(k,k)/k^2), Inner()))))) for k=1:kval) for ca in cas)
-        return -(wvals[i]-maximum(wvals[1:length(wvals) .!= i]))
-    end
-    #return @distributed (max) for x = cls
-    #    return nfn(x)
-    #end
-    return mapreduce(nfn, max, cls)
-end
-
 function pm_meas_window_new(am, images, ntiles, concfun, locmaps, kval)
 
     cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)), eachindex(images) )
@@ -364,6 +284,16 @@ function pm_meas_window_new(am, images, ntiles, concfun, locmaps, kval)
     #end
     return mapreduce(nfn, max, cls)
 end
+
+
+function flag_meas_window_new(alloweds, nhigh, chigh, ntiles, locmaps, kval)
+    cl = ones(ntiles)
+    cl[alloweds[1:nhigh]]=chigh
+    cas = [log.(concs_to_array(lm, cl)) for lm in locmaps]
+    wvals = log.(sum(sum(exp.(kval^2*imfilter(ca, centered(ones(kval,kval)/kval^2), Inner())))) for ca in cas)
+    return -(wvals[1]-maximum(wvals[2:end]))
+end
+
 
 function pm_meas_lowlow(am, images, ntiles, concfun, locmaps, depth, trialsperpoint, params)
     cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)),
@@ -437,38 +367,6 @@ function pattern_match_TC_lowlow(tiletypes, usecodes, locmaps, images, params, c
     return r
 end
 
-
-
-function pattern_match_TC_window(tiletypes, usecodes, locmaps, images, params, concfun;
-                       initassign::Union{Nothing, Array{Int64,2}}=nothing, kval=5,
-                       sn=1, nworkers=1)
-    allowedtiles = findall(x -> x in usecodes, tiletypes).-1
-    if length(allowedtiles) > length(images[1])
-        println("Oh dear")
-    end
-    if initassign == nothing
-        assignmap = fill(-1, size(images[1]))
-        initplaces = sample(CartesianIndices(assignmap), length(allowedtiles), replace=false)
-        for i in eachindex(initplaces)
-            assignmap[initplaces[i]] = allowedtiles[i]
-        end
-    else
-        assignmap = initassign::Array{Int64,2}
-    end
-
-    println(assignmap)
-    ntiles = length(tiletypes)
-    
-
-    mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
-                                    (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
-                                    x -> pm_meas_window_k2(x, images, ntiles, concfun, locmaps, kval))
-
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, nworkers)
-
-    return r
-end
-
               
 function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concfun;
                                  initassign::Union{Nothing, Array{Int64,2}}=nothing, kval=5,
@@ -496,6 +394,48 @@ function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concf
                                     x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval))
 
     r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, nworkers)
+
+    return r
+end
+
+using Random
+
+function restricted_swap!(value::Array, indexpool::Array)
+    n = sample(indexpool, 2, replace=false)
+    value[n[1]], value[n[2]] = value[n[2]], value[n[1]]
+    return n
+end
+
+function doswap!(value::Array, n::Array)
+    value[n[1]], value[n[2]] = value[n[2]], value[n[1]]
+end
+
+function partswap!(value::Array, divline::Int64)
+    n1 = random(1:divline)
+    n2 = random((divline+1):length(value))
+    value[n1], value[n2] = value[n2], value[n1]
+    return [n1, n2]
+end
+
+
+              
+function makeflag_fastmodel(tiletypes, usecodes, locmaps, nhigh, chigh;
+                            initallowed::Union{Nothing, Array{Int64,1}}=nothing,
+                            kval=5, sn=1, nworkers=1)
+
+    if initallowed== nothing
+        initallowed = findall(x -> x in usecodes, tiletypes)
+        shuffle!(initallowed)
+    end
+    al = copy(initallowed) # copy to avoid modifying input initcl
+
+    ntiles = length(tiletypes)
+    
+    mr = TinyClimbers.MountainRange(x -> partswap!(x, nhigh),
+                                    (x,y) -> iswap!(x, y),
+                                    x -> flag_meas_window_new(x, nhigh, chigh, ntiles, locmaps, kval))
+
+    r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
 
     return r
 end
