@@ -3,6 +3,7 @@ module TwoStepNuc
 using StatsBase
 using Distributed
 using ImageFiltering
+import TinyClimbers
 
 const OFF4 = [CartesianIndex(1,0),CartesianIndex(-1,0),
               CartesianIndex(0,1),CartesianIndex(0,-1)]
@@ -264,7 +265,6 @@ function pattern_match(tiletypes, usecodes, locmaps, images, params, concfun, bo
         assignmap = initassign::Array{Int64,2}
     end
     
-    println(assignmap)
     allplaceindices = CartesianIndices(assignmap)
     ntiles = length(tiletypes)
     
@@ -470,7 +470,7 @@ function pattern_match_TC_window(tiletypes, usecodes, locmaps, images, params, c
 end
 
               
-function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, params, concfun;
+function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concfun;
                                  initassign::Union{Nothing, Array{Int64,2}}=nothing, kval=5,
                                  sn=1, nworkers=1)
     allowedtiles = findall(x -> x in usecodes, tiletypes).-1
