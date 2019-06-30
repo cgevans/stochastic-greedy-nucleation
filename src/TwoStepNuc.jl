@@ -1,5 +1,7 @@
 module TwoStepNuc
 
+export pm_meas, basic_concfun, pattern_match_TC_window_new, pattern_match_TC, KTAMParams
+
 using StatsBase
 using Distributed
 using ImageFiltering
@@ -268,6 +270,16 @@ function pm_meas(am, images, ntiles, concfun, locmaps, depth, trialsperpoint, pa
     #end
 end
 
+function flag_meas_twostep_new(alloweds, nhigh, chigh, ntiles, locmaps, depth, trialsperpoint, params)
+    cl = ones(ntiles)
+    cl[alloweds[1:nhigh]].=chigh
+    gces = map(locmaps) do lm
+        return probabilistic_gce(concs_to_array(lm, cl), depth, trialsperpoint,
+                                 params)[1]
+    end
+    return gces[1]-minimum(gces[2:end])
+end
+
 function pm_meas_window_new(am, images, ntiles, concfun, locmaps, kval)
 
     cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)), eachindex(images) )
@@ -288,7 +300,7 @@ end
 
 function flag_meas_window_new(alloweds, nhigh, chigh, ntiles, locmaps, kval)
     cl = ones(ntiles)
-    cl[alloweds[1:nhigh]]=chigh
+    cl[alloweds[1:nhigh]].=chigh
     cas = [log.(concs_to_array(lm, cl)) for lm in locmaps]
     wvals = log.(sum(sum(exp.(kval^2*imfilter(ca, centered(ones(kval,kval)/kval^2), Inner())))) for ca in cas)
     return -(wvals[1]-maximum(wvals[2:end]))
@@ -309,30 +321,42 @@ end
 
 function pattern_match_TC(tiletypes, usecodes, locmaps, images, params, concfun;
                        initassign::Union{Nothing, Array{Int64,2}}=nothing, trialsperpoint=30,
-                       depth=10, sn=1, nworkers=1)
+                       depth=10, sn=1, pids=[2], rightblank=false)
     allowedtiles = findall(x -> x in usecodes, tiletypes).-1
     if length(allowedtiles) > length(images[1])
         println("Oh dear")
     end
-    if initassign == nothing
+    if (initassign == nothing) && (!rightblank)
         assignmap = fill(-1, size(images[1]))
         initplaces = sample(CartesianIndices(assignmap), length(allowedtiles), replace=false)
         for i in eachindex(initplaces)
             assignmap[initplaces[i]] = allowedtiles[i]
         end
+    elseif (initassign == nothing) && rightblank
+        assignmap = fill(-1, size(images[1]))
+        shuffle!(allowedtiles)
+        for (at, ix) in zip(allowedtiles, CartesianIndices(assignmap))
+            assignmap[ix] = at
+        end
     else
         assignmap = initassign::Array{Int64,2}
     end
-
-    println(assignmap)
+    
     ntiles = length(tiletypes)
     
-
-    mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
-                                    (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
-                                    x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params))
-
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, nworkers)
+    
+    if !rightblank
+        mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
+                                        (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
+                                        x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params))            
+    else    
+        mr = TinyClimbers.MountainRange(swap_fix_m1!,
+                                        doswap!,
+                                        x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params))
+    end        
+    
+    
+    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, pids)
 
     return r
 end
@@ -344,15 +368,21 @@ function pattern_match_TC_lowlow(tiletypes, usecodes, locmaps, images, params, c
     if length(allowedtiles) > length(images[1])
         println("Oh dear")
     end
-    if initassign == nothing
+    if (initassign == nothing) && (!rightblank)
         assignmap = fill(-1, size(images[1]))
         initplaces = sample(CartesianIndices(assignmap), length(allowedtiles), replace=false)
         for i in eachindex(initplaces)
             assignmap[initplaces[i]] = allowedtiles[i]
         end
+    elseif (initassign == nothing) && rightblank
+        assignmap = fill(-1, size(images[1]))
+        shuffle!(allowedtiles)
+        for (at, ix) in zip(allowedtiles, CartesianIndices(assignmap))
+            assignmap[ix] = at
+        end
     else
         assignmap = initassign::Array{Int64,2}
-    end
+    end    
 
     println(assignmap)
     ntiles = length(tiletypes)
@@ -370,30 +400,41 @@ end
               
 function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concfun;
                                  initassign::Union{Nothing, Array{Int64,2}}=nothing, kval=5,
-                                 sn=1, nworkers=1)
+                                 sn=1, pids=[2], rightblank=false, uit=1000)
     allowedtiles = findall(x -> x in usecodes, tiletypes).-1
     if length(allowedtiles) > length(images[1])
         println("Oh dear")
     end
-    if initassign == nothing
+    if (initassign == nothing) && (!rightblank)
         assignmap = fill(-1, size(images[1]))
         initplaces = sample(CartesianIndices(assignmap), length(allowedtiles), replace=false)
         for i in eachindex(initplaces)
             assignmap[initplaces[i]] = allowedtiles[i]
         end
+    elseif (initassign == nothing) && rightblank
+        assignmap = fill(-1, size(images[1]))
+        shuffle!(allowedtiles)
+        for (at, ix) in zip(allowedtiles, CartesianIndices(assignmap))
+            assignmap[ix] = at
+        end
     else
         assignmap = initassign::Array{Int64,2}
     end
 
-    println(assignmap)
     ntiles = length(tiletypes)
     
+    if !rightblank
+        mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
+                                        (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
+                                        x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval))
+    else
 
-    mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
-                                    (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
-                                    x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval))
+        mr = TinyClimbers.MountainRange(swap_fix_m1!,
+                                        doswap!,
+                                        x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval))
+    end        
 
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, nworkers)
+    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, pids, uit=uit)
 
     return r
 end
@@ -411,13 +452,24 @@ function doswap!(value::Array, n::Array)
 end
 
 function partswap!(value::Array, divline::Int64)
-    n1 = random(1:divline)
-    n2 = random((divline+1):length(value))
+    n1 = rand(1:divline)
+    n2 = rand((divline+1):length(value))
     value[n1], value[n2] = value[n2], value[n1]
     return [n1, n2]
 end
 
-
+function swap_fix_m1!(value::Array)
+    r = 1:(length(value))
+    while true
+        i1 = rand(r)
+        i2 = rand(r)
+        if (i2 == i1) || (value[i1] == -1) || (value[i2] == -1)
+            continue
+        end
+        value[i1], value[i2] = value[i2], value[i1]
+        return [i1, i2]
+    end
+end
               
 function makeflag_fastmodel(tiletypes, usecodes, locmaps, nhigh, chigh;
                             initallowed::Union{Nothing, Array{Int64,1}}=nothing,
@@ -432,8 +484,29 @@ function makeflag_fastmodel(tiletypes, usecodes, locmaps, nhigh, chigh;
     ntiles = length(tiletypes)
     
     mr = TinyClimbers.MountainRange(x -> partswap!(x, nhigh),
-                                    (x,y) -> iswap!(x, y),
+                                    (x,y) -> doswap!(x, y),
                                     x -> flag_meas_window_new(x, nhigh, chigh, ntiles, locmaps, kval))
+
+    r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
+
+    return r
+end
+
+function makeflag_goodmodel(tiletypes, usecodes, locmaps, nhigh, chigh, params;
+                            initallowed::Union{Nothing, Array{Int64,1}}=nothing,
+                            kval=5, sn=1, nworkers=1, trialsperpoint=300, depth=14)
+
+    if initallowed== nothing
+        initallowed = findall(x -> x in usecodes, tiletypes)
+        shuffle!(initallowed)
+    end
+    al = copy(initallowed) # copy to avoid modifying input initcl
+
+    ntiles = length(tiletypes)
+    
+    mr = TinyClimbers.MountainRange(x -> partswap!(x, nhigh),
+                                    (x,y) -> doswap!(x, y),
+                                    x -> flag_meas_twostep_new(x, nhigh, chigh, ntiles, locmaps, depth, trialsperpoint, params))
 
     r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
 
