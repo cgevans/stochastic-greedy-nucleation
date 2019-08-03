@@ -6,6 +6,7 @@ using StatsBase
 using Distributed
 using ImageFiltering
 import TinyClimbers
+using DataStructures
 
 const OFF4 = [CartesianIndex(1,0),CartesianIndex(-1,0),
               CartesianIndex(0,1),CartesianIndex(0,-1)]
@@ -14,10 +15,10 @@ const OFF5 = [CartesianIndex(0,0),
               CartesianIndex(1,0),CartesianIndex(-1,0),
               CartesianIndex(0,1),CartesianIndex(0,-1)]
 
-LocationArray = Array{Int64,2}
-ConcList = Array{Float64,1}
-ConcArray = Array{Float64,2}
-FillArray = Array{Bool,2}
+const LocationArray = Array{Int64,2}
+const ConcList = Array{Float64,1}
+const ConcArray = Array{Float64,2}
+const FillArray = Array{Bool,2}
 
 struct KTAMParams
     gse::Float64
@@ -95,7 +96,7 @@ function maketypes(cmaps...)
 end
 
 
-function flag_concs(tiletypes::Array{Char}, flagtiles::Array{Int64},
+function flag_concs(tiletypes::Array{Char,1}, flagtiles::Array{Int64,1},
                     depletetypes::Array{Char}, baseconc::Float64,
                     flagconc::Float64, deplete::Float64)
     # Tiles start from 0, as in SHAM, so tiletypes[tilenum+1] = type of tilenum
@@ -124,7 +125,7 @@ end
 #lowlowgce
 function lowlow_gce(concarray::ConcArray, depth::Int64, trials::Int64, p::KTAMParams)
     # set of critical nuclei:
-    cns = Set{FillArray}()
+    cns = Array{Array{Bool,2},1}()
     Gs = Float64[]
     minG = fill(Inf, size(concarray))
 
@@ -153,8 +154,8 @@ end
 
 function probabilistic_gce(concarray::ConcArray, depth::Int64, trials::Int64, p::KTAMParams)
     # set of critical nuclei:
-    cns = Set{FillArray}()
-    Gs = Float64[]
+    cns = OrderedSet{FillArray}() #FillArray[]
+    Gs = Float64[] # Float64[]
     minG = fill(Inf, size(concarray))
 
     for startloc in CartesianIndices(concarray)
@@ -280,6 +281,20 @@ function flag_meas_twostep_new(alloweds, nhigh, chigh, ntiles, locmaps, depth, t
     return gces[1]-minimum(gces[2:end])
 end
 
+function conc_meas_twostep(concs, nhigh, chigh, ntiles, locmaps, depth, trialsperpoint, params; retall=false)
+    gces = map(locmaps) do lm
+        return probabilistic_gce(concs_to_array(lm, concs), depth, trialsperpoint,
+                                 params)[1]
+    end
+    if !retall
+        return gces[1]-minimum(gces[2:end])
+    else
+        return gces[1]-minimum(gces[2:end]), gces
+    end
+    
+end
+
+
 function pm_meas_window_new(am, images, ntiles, concfun, locmaps, kval)
 
     cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)), eachindex(images) )
@@ -346,57 +361,20 @@ function pattern_match_TC(tiletypes, usecodes, locmaps, images, params, concfun;
     
     
     if !rightblank
-        mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
-                                        (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
-                                        x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params))            
+        sf = x -> TinyClimbers.swapstep!(x, nsteps=sn)
+        sb = (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn)
+        meas = x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params)
     else    
-        mr = TinyClimbers.MountainRange(swap_fix_m1!,
-                                        doswap!,
-                                        x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params))
+        sf = swap_fix_m1!
+        sb = doswap! 
+        meas = x -> pm_meas(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params)
     end        
     
     
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, pids)
+    r = TinyClimbers.hillclimb_paranoidclimbers(meas, sf, sb, assignmap, pids)
 
     return r
 end
-
-function pattern_match_TC_lowlow(tiletypes, usecodes, locmaps, images, params, concfun;
-                       initassign::Union{Nothing, Array{Int64,2}}=nothing, trialsperpoint=30,
-                       depth=10, sn=1, nworkers=1)
-    allowedtiles = findall(x -> x in usecodes, tiletypes).-1
-    if length(allowedtiles) > length(images[1])
-        println("Oh dear")
-    end
-    if (initassign == nothing) && (!rightblank)
-        assignmap = fill(-1, size(images[1]))
-        initplaces = sample(CartesianIndices(assignmap), length(allowedtiles), replace=false)
-        for i in eachindex(initplaces)
-            assignmap[initplaces[i]] = allowedtiles[i]
-        end
-    elseif (initassign == nothing) && rightblank
-        assignmap = fill(-1, size(images[1]))
-        shuffle!(allowedtiles)
-        for (at, ix) in zip(allowedtiles, CartesianIndices(assignmap))
-            assignmap[ix] = at
-        end
-    else
-        assignmap = initassign::Array{Int64,2}
-    end    
-
-    println(assignmap)
-    ntiles = length(tiletypes)
-    
-
-    mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
-                                    (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
-                                    x -> pm_meas_lowlow(x, images, ntiles, concfun, locmaps, depth, trialsperpoint, params))
-
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, nworkers)
-
-    return r
-end
-
               
 function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concfun;
                                  initassign::Union{Nothing, Array{Int64,2}}=nothing, kval=5,
@@ -424,17 +402,16 @@ function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concf
     ntiles = length(tiletypes)
     
     if !rightblank
-        mr = TinyClimbers.MountainRange(x -> TinyClimbers.swapstep!(x, nsteps=sn),
-                                        (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn),
-                                        x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval))
+        sf = x -> TinyClimbers.swapstep!(x, nsteps=sn)
+        sb = (x,y) -> TinyClimbers.swapstep!(x, y, nsteps=sn)
+        meas = x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval)
     else
-
-        mr = TinyClimbers.MountainRange(swap_fix_m1!,
-                                        doswap!,
-                                        x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval))
+        sf = swap_fix_m1!
+        sb = doswap!
+        meas = x -> pm_meas_window_new(x, images, ntiles, concfun, locmaps, kval)
     end        
 
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, assignmap, pids, uit=uit)
+    r = TinyClimbers.hillclimb_paranoidclimbers(meas, sf, sb, assignmap, pids, uit=uit)
 
     return r
 end
