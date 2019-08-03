@@ -1,9 +1,10 @@
 name = "TwoStepNuc"
 uuid = "fef27a42-81c1-11e9-2862-e70852c602f5"
 authors = ["Constantine Evans <cevans@evanslabs.org>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 ImageFiltering = "6a3955dd-da59-5b1f-98d4-e7296123deb5"
 ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
