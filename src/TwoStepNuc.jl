@@ -603,7 +603,7 @@ Then add that step to `m`. Return `m` and the dG of the attachment.
 function probableStep!(m, gse, ep, f, dGatt, probs)
     totalprob = sum(probs)
     if totalprob == 0
-        return m, 0
+        return m, 0, dGatt, probs, CartesianIndex(-1, -1) #-1,-1 indicates no addition here.
     end
     r = totalprob * rand()
     accum = 0
@@ -707,6 +707,12 @@ function probableTrajectory_singlesite(loc, gse, ep, f, steps; checkmp=false,
     update_dGatt_and_probs_around!(dGatt,probs,loc,m,gse,ep,f)
     for step = 2:steps
         m, dG, dGatt, probs, loc = probableStep!(m, gse, ep, f, dGatt, probs)
+
+        # loc = -1,-1 → no more steps possible
+        if loc == CartesianIndex(-1,-1)
+            break
+        end
+        
         Gtrace[step] += dG
 
         # mountain pass check
