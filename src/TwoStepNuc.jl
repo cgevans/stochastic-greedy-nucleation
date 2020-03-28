@@ -105,6 +105,10 @@ function probable_trajectory(concmult, starting_site, p::KTAMParams,
     current_cn = zeros(Bool, size(concmult))
     current_Gcn = -Inf
     current_critstep = 1
+
+    # keeps track of whether the state could, by an arbitrary series
+    # of additions, become previous_cns[i]
+    could_become_previous_cns = ones(Bool, length(previous_cns))
     
     trace = Float64[]
     
@@ -143,9 +147,25 @@ function probable_trajectory(concmult, starting_site, p::KTAMParams,
         end
 
         # break if we are in a state that was in previous_cns.
-        if state in previous_cns
-            return Inf, current_cn, trace, current_critstep
+        # But we'll be smart here.  There's no point in checking equality if
+        # a previous state (we're like the aTAM here with no detachments) had a
+        # tile in a place where the CN we're comparing with didn't.  So we'll
+        # keep track of this, and save ourselves quite a bit of time.
+        #if state in previous_cns
+        #    return Inf, current_cn, trace, current_critstep
+        #end
+
+        for i in eachindex(could_become_previous_cns)
+            if !could_become_previous_cns[i]
+                continue
+            elseif any( state .& (.! previous_cns[i]))
+                could_become_previous_cns[i] = false
+            elseif state == previous_cns[i]
+                return Inf, current_cn, trace, current_critstep
+            end
         end
+        
+                
         
         # we're actually in a new state.  Update stuff:
         G += dG
