@@ -66,6 +66,8 @@ function probabilistic_gce(concarray::ConcArray, trials::Int64, p::KTAMParams,
     found_traces = Array{Array{Float64,1},1}()
     min_G_per_site = fill(Inf, size(concarray))
 
+    stoppedtrials = 0
+
     for i in 1:trials
         # Our starting site is chosen probabilistically based on concentration.
         starting_site = choose_position(concarray)
@@ -80,6 +82,7 @@ function probabilistic_gce(concarray::ConcArray, trials::Int64, p::KTAMParams,
         # Gcn is returned as Inf if the trajectory passed through a previously-
         # found critical nucleus.
         if Gcn == Inf
+            stoppedtrials += 1
             continue
         end
 
@@ -94,7 +97,7 @@ function probabilistic_gce(concarray::ConcArray, trials::Int64, p::KTAMParams,
     # most likely ones are first.
     sortkey = sortperm(found_Gcns)
     
-    return Gce, found_Gcns[sortkey], found_cns[sortkey], found_traces[sortkey]
+    return Gce, found_Gcns[sortkey], found_cns[sortkey], found_traces[sortkey], stoppedtrials/trials
 end
 
 function probable_trajectory(concmult, starting_site, p::KTAMParams,
@@ -154,18 +157,26 @@ function probable_trajectory(concmult, starting_site, p::KTAMParams,
         #if state in previous_cns
         #    return Inf, current_cn, trace, current_critstep
         #end
-
+        
         for i in eachindex(could_become_previous_cns)
+            noteq = false
             if !could_become_previous_cns[i]
                 continue
-            elseif any( state .& (.! previous_cns[i]))
-                could_become_previous_cns[i] = false
-            elseif state == previous_cns[i]
-                return Inf, current_cn, trace, current_critstep
+            else
+                for loc in eachindex(state)
+                    if state[loc] & (!previous_cns[i][loc])
+                        could_become_previous_cns[i] = false
+                        noteq = true
+                        break
+                    elseif (!state[loc]) & (previous_cns[i][loc])
+                        noteq = true
+                    end
+                end
+                if !noteq
+                    return Inf, current_cn, trace, current_critstep
+                end
             end
         end
-        
-                
         
         # we're actually in a new state.  Update stuff:
         G += dG
@@ -236,7 +247,6 @@ function update_dGatt_and_probs_around!(concmult, dGatt, probs,
             end
         end
     end
-    return dGatt, probs
 end
 
 function fillFavorable_sl!(concmult, dGatt, probs,
