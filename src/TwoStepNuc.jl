@@ -1,13 +1,14 @@
 module TwoStepNuc
 
-export pm_meas, basic_concfun, pattern_match_TC_window_new, pattern_match_TC, KTAMParams
+#export pm_meas, basic_concfun, pattern_match_TC_window_new, pattern_match_TC, KTAMParams
 
 using StatsBase
 using Distributed
 using ImageFiltering
 import TinyClimbers
 using DataStructures
-
+using Random
+using TinyClimbers
 const OFF4 = [CartesianIndex(1,0),CartesianIndex(-1,0),
               CartesianIndex(0,1),CartesianIndex(0,-1)]
 
@@ -21,8 +22,247 @@ const ConcArray = Array{Float64,2}
 const FillArray = Array{Bool,2}
 
 struct KTAMParams
-    gse::Float64
-    eps::Float64
+    gmc::Float64
+    gse::Float64    
+    alpha::Float64
+    kf::Float64
+end
+
+G_se(p::KTAMParams) = p.gse
+G_mc(p::KTAMParams) = p.gmc
+k_f(p::KTAMParams) = p.kf
+epsilon(p::KTAMParams) = 2*p.gse - p.gmc
+alpha(p::KTAMParams) = p.alpha
+kh_f(p::KTAMParams) = p.kf * exp(-alpha)
+
+""" 
+Choose a starting site, given a concentration array.  Note that this could be
+concentration factors, or actual concentrations: the calculation should be the same.
+
+We're just choosing here based on total concentration, not dimer formation rate,
+which could be the better option but probably just makes things more complicated.
+"""
+function choose_position_presummed(weights, summed)
+    trigger = summed * rand()
+    accum = 0
+    for i in eachindex(weights)
+        @inbounds accum += weights[i]
+        if accum >= trigger
+            return CartesianIndices(weights)[i]
+        end
+    end
+end
+
+function choose_position(weights)
+    full_val = sum(weights)
+    return choose_position_presummed(weights, full_val)
+end
+
+function probabilistic_gce(concarray::ConcArray, trials::Int64, p::KTAMParams,
+                           depth::Int64=typemax(Int64))
+    # set of critical nuclei:
+    found_cns = Array{FillArray,1}()
+    found_Gcns = Float64[]
+    found_traces = Array{Array{Float64,1},1}()
+    min_G_per_site = fill(Inf, size(concarray))
+
+    for i in 1:trials
+        # Our starting site is chosen probabilistically based on concentration.
+        starting_site = choose_position(concarray)
+
+        # This will give us a new critical nucleus and trajectory, starting from
+        # that site, or will fail, if it passes through a critical nucleus that
+        # has already been found.
+        Gcn, cn, G_trace, crit_step = probable_trajectory(concarray, starting_site, p,
+                                                          found_cns,
+                                                          depth)
+
+        # Gcn is returned as Inf if the trajectory passed through a previously-
+        # found critical nucleus.
+        if Gcn == Inf
+            continue
+        end
+
+        push!(found_Gcns, Gcn)
+        push!(found_cns,  cn)
+        push!(found_traces, G_trace)
+    end
+
+    Gce = -log(sum(exp.(-found_Gcns)))
+
+    # We will sort all our critical nuclei, so that the
+    # most likely ones are first.
+    sortkey = sortperm(found_Gcns)
+    
+    return Gce, found_Gcns[sortkey], found_cns[sortkey], found_traces[sortkey]
+end
+
+function probable_trajectory(concmult, starting_site, p::KTAMParams,
+                             previous_cns::Array{FillArray,1}, depth::Int64=typemax(Int64))
+
+    state = zeros(Bool, size(concmult))
+
+    current_cn = zeros(Bool, size(concmult))
+    current_Gcn = -Inf
+    current_critstep = 1
+    
+    trace = Float64[]
+    
+    # Stop if the initial site has no tile there!
+    if concmult[starting_site] == 0
+        return Inf, current_cn, trace, current_critstep
+    end
+
+    # To start, add the initial tile to the state.
+    state[starting_site] = true
+
+    # We include alpha here, because not including it is
+    # really confusing.  Every tile attachment doesn't include it,
+    # because the attachment G_mc includes it, but here, since we
+    # are just looking at a single tile, where alpha should not be
+    # included, we need to compensate for it.
+    # This means we have $[c]_{eq} = u_0 e^{-G}$, as we would expect,
+    # for both the single tile, and all future assemblies.
+    G = G_mc(p) - alpha(p) - log(concmult[starting_site])
+    push!(trace, G)
+
+    stepnum = 2
+
+    dGatt = fill(Inf, size(concmult))
+    probs = zeros(size(dGatt))
+    update_dGatt_and_probs_around!(concmult, dGatt, probs,
+                                   state, starting_site, p)
+
+    while stepnum <= depth
+        site, dG = probabilistic_step!(concmult, dGatt, probs,
+                                     state, p)
+
+        # loc = -1,-1 → no more steps were possible
+        if site == CartesianIndex(-1,-1)
+            break
+        end
+
+        # break if we are in a state that was in previous_cns.
+        if state in previous_cns
+            return Inf, current_cn, trace, current_critstep
+        end
+        
+        # we're actually in a new state.  Update stuff:
+        G += dG
+        push!(trace, G)
+
+        # Are we in a state of higher G than we've seen before?
+        # If so, that seems like our new best guess of critical
+        # nucleus.
+        if G > current_Gcn
+            current_Gcn = G
+            current_critstep = stepnum
+            copyto!(current_cn, state)
+        end
+        
+        # Fill the state with dG<0 steps.
+        dG = fillFavorable_sl!(concmult, dGatt, probs,
+                               state, site, p)
+        G += dG
+    end
+
+    return current_Gcn, current_cn, trace, current_critstep
+end
+
+function probabilistic_step!(concmult, dGatt, probs, state, p)
+    totalprob = sum(probs)
+    if totalprob == 0
+        return CartesianIndex(-1, -1), Inf  # -1, -1 indicates no possible addition
+    end
+    
+    loc = choose_position_presummed(probs, totalprob)
+
+    dG = dGatt[loc]
+    state[loc] = true
+    
+    update_dGatt_and_probs_around!(concmult, dGatt, probs,
+                                   state, loc, p)    
+
+    return loc, dG
+end
+
+"""modifies dGatt and probs"""
+function update_dGatt_and_probs_around!(concmult, dGatt, probs,
+                                        state, loc, p)
+    # We need to update probabilities for the location, and
+    # the adjacent cells.
+    for offset in OFF5
+        ij = loc + offset
+
+        # no need to update stuff outside the boundary!
+        # after this, we can assume the location is inbounds.
+        if !checkbounds(Bool, dGatt, ij)
+            continue
+        end
+        
+        if @inbounds state[ij] != 0   # we never revisit a filled site
+            @inbounds dGatt[ij] = Inf  
+            @inbounds probs[ij] = 0
+        else
+            # Calculate the number of bonds that would be made by attaching a tile at ij.
+            @inbounds b = (ij[1]>1 ? state[ij[1]-1,ij[2]] : 0) + (ij[2]>1 ? state[ij[1],ij[2]-1] : 0) +
+                (ij[1]<size(state,1) ? state[ij[1]+1,ij[2]] : 0) + (ij[2]<size(state,2) ? state[ij[1],ij[2]+1] : 0)
+            if b == 0
+                @inbounds dGatt[ij] = Inf
+                @inbounds probs[ij] = 0
+            else
+                @inbounds dGatt[ij] = G_mc(p) - b*G_se(p) - log(concmult[ij])
+                @inbounds probs[ij] = exp(-dGatt[ij])
+            end
+        end
+    end
+    return dGatt, probs
+end
+
+function fillFavorable_sl!(concmult, dGatt, probs,
+                           state, loc, p)
+    totaldG = 0
+    while true
+        didsomething = false
+        # The only place we might have new dG<0 steps is
+        # in sites adjacent to previous attachments, so
+        # we check there.
+        for offset = OFF4
+            trialsite = loc + offset
+
+            # We may be out of bounds
+            if (!checkbounds(Bool, dGatt, trialsite)) 
+                continue
+            end
+
+            # Do we have a dG < 0 site?
+            if @inbounds (dG = dGatt[trialsite]) < 0
+                loc = trialsite
+                @inbounds state[loc] = true
+                @inbounds totaldG += dG
+                update_dGatt_and_probs_around!(concmult, dGatt, probs,
+                                               state, loc, p)    
+                didsomething = true
+                break
+            end
+        end
+        if !didsomething
+            break
+        end
+    end
+    return totaldG
+end
+
+function N(m)
+    return sum(m)
+end
+
+function B(m)
+    return sum(m[1:end-1,:] .& m[2:end,:]) + sum(m[:,1:end-1] .& m[:,2:end])
+end
+
+function G(concmult, state, p)
+    return N(state)*G_mc(p) - B(state)*G_se(p) - sum(log.(concmult[state])) - alpha(p)
 end
 
 """
@@ -95,7 +335,6 @@ function maketypes(cmaps...)
     return typearray
 end
 
-
 function flag_concs(tiletypes::Array{Char,1}, flagtiles::Array{Int64,1},
                     depletetypes::Array{Char}, baseconc::Float64,
                     flagconc::Float64, deplete::Float64)
@@ -120,72 +359,6 @@ function flag_concs(tiletypes, flagtiles::Array{String},
     flagtiles_int = map(x -> parse(Int64, x[2:end]), flagtiles)
     return flag_concs(tiletypes, flagtiles_int, depletetypes, baseconc, flagconc, deplete)
 end
-
-
-#lowlowgce
-function lowlow_gce(concarray::ConcArray, depth::Int64, trials::Int64, p::KTAMParams)
-    # set of critical nuclei:
-    cns = Array{Array{Bool,2},1}()
-    Gs = Float64[]
-    minG = fill(Inf, size(concarray))
-
-    for startloc in CartesianIndices(concarray)
-            g, cn, tr, cnsize, formin = lowLowTrajectory_singlesite(startloc, p.gse, p.eps,
-                                                                      concarray,
-                                                                      depth; checkmp=true,
-                                                                      cnar=cns)
-            if formin < minG[startloc]
-                minG[startloc] = formin
-            end
-            if g == Inf
-                continue
-            end
-            # checkmp already ensures this
-            #if cn in cns
-            #    continue
-            #end
-
-            push!(Gs, g)
-            push!(cns, cn)
-    end
-    Gce = -log(sum(exp.(-Gs)))
-    return Gce, cns, Gs, minG
-end
-
-function probabilistic_gce(concarray::ConcArray, depth::Int64, trials::Int64, p::KTAMParams)
-    # set of critical nuclei:
-    cns = OrderedSet{FillArray}() #FillArray[]
-    Gs = Float64[] # Float64[]
-    minG = fill(Inf, size(concarray))
-
-    for startloc in CartesianIndices(concarray)
-        for i in 1:trials
-            g, cn, tr, cnsize, formin = probableTrajectory_singlesite(startloc, p.gse, p.eps,
-                                                                      concarray,
-                                                                      depth; checkmp=true,
-                                                                      cnar=cns)
-            if formin < minG[startloc]
-                minG[startloc] = formin
-            end
-            if g == Inf
-                continue
-            end
-            # checkmp already ensures this
-            #if cn in cns
-            #    continue
-            #end
-
-            push!(Gs, g)
-            push!(cns, cn)
-        end
-    end
-    Gce = -log(sum(exp.(-Gs)))
-    return Gce, cns, Gs, minG
-end
-
-
-
-using StatsBase
 
 function make_hillflag(tiletypes, flagcodes, locmaps, nflagtiles, params, flagmult, boredmax)
     # Goal here is to use a hill-climbing algorithm just to try to make
@@ -249,8 +422,6 @@ function assignmap_to_conclist(image, ntiles, assignmap, concfun)
     return concarray
 end
 
-using .TinyClimbers
-
 function pm_meas(am, images, ntiles, concfun, locmaps, depth, trialsperpoint, params)
     cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)), eachindex(images) )
     function nfn(x)
@@ -294,7 +465,6 @@ function conc_meas_twostep(concs, nhigh, chigh, ntiles, locmaps, depth, trialspe
     
 end
 
-
 function pm_meas_window_new(am, images, ntiles, concfun, locmaps, kval)
 
     cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)), eachindex(images) )
@@ -312,26 +482,12 @@ function pm_meas_window_new(am, images, ntiles, concfun, locmaps, kval)
     return mapreduce(nfn, max, cls)
 end
 
-
 function flag_meas_window_new(alloweds, nhigh, chigh, ntiles, locmaps, kval)
     cl = ones(ntiles)
     cl[alloweds[1:nhigh]].=chigh
     cas = [log.(concs_to_array(lm, cl)) for lm in locmaps]
     wvals = log.(sum(sum(exp.(kval^2*imfilter(ca, centered(ones(kval,kval)/kval^2), Inner())))) for ca in cas)
     return -(wvals[1]-maximum(wvals[2:end]))
-end
-
-
-function pm_meas_lowlow(am, images, ntiles, concfun, locmaps, depth, trialsperpoint, params)
-    cls = map( x -> (x, assignmap_to_conclist(images[x], ntiles, am, concfun)),
-               eachindex(images) )
-    return @distributed (max) for (i,cl) = cls
-        gces = pmap(locmaps) do lm
-            return lowlow_gce(concs_to_array(lm, cl), depth, trialsperpoint,
-                                     params)[1]
-        end
-        return gces[i]-minimum(gces[1:length(gces) .!= i])
-    end
 end
 
 function pattern_match_TC(tiletypes, usecodes, locmaps, images, params, concfun;
@@ -416,8 +572,6 @@ function pattern_match_TC_window_new(tiletypes, usecodes, locmaps, images, concf
     return r
 end
 
-using Random
-
 function restricted_swap!(value::Array, indexpool::Array)
     n = sample(indexpool, 2, replace=false)
     value[n[1]], value[n[2]] = value[n[2]], value[n[1]]
@@ -490,184 +644,6 @@ function makeflag_goodmodel(tiletypes, usecodes, locmaps, nhigh, chigh, params;
     return r
 end
 
-"""
-    N(m)
-
-Return the number of tiles in assembly (1/0 values) `m`.
-"""
-function N(m)
-    return sum(m)
-end
-
-function B(m)
-    return sum(m[1:end-1,:] .& m[2:end,:]) + sum(m[:,1:end-1] .& m[:,2:end])
-end
-
-function zerolog(x)
-    x==0 ? 0 : log(x)
-end
-
-function G(m, gse, ep, f)
-    return (2*N(m)-B(m))*gse - N(m)*ep - sum(m .* zerolog.(f))
-end
-
-
-
-"""
-    dGatt(m, gse, ep, f)
-
-For an assembly `m`, and parameters, give the dG at each potential attachment 
-site, with +Inf for any site that doesn't allow attachment, or already has a tile present.
-"""
-function calc_dGatt(m, gse, ep, f)
-    r = similar(m, Float64)
-    for ij in CartesianIndices(m)
-        if m[ij] != 0
-            r[ij] = Inf
-        else
-            b = (ij[1]>1 ? m[ij[1]-1,ij[2]] : 0) + (ij[2]>1 ? m[ij[1],ij[2]-1] : 0) +
-                (ij[1]<size(m,1) ? m[ij[1]+1,ij[2]] : 0) + (ij[2]<size(m,2) ? m[ij[1],ij[2]+1] : 0)
-            if b == 0
-                r[ij] = Inf
-            else
-                r[ij] = (2 - b) * gse - ep - log(f[ij])
-            end
-        end
-    end
-    return r
-end
-
-function update_dGatt_and_probs_around!(dGatt, probs, loc, m, gse, ep, f)
-    for offset in OFF5
-        ij = loc + offset
-        if !checkbounds(Bool, dGatt, ij)
-            continue
-        end        
-        if @inbounds m[ij] != 0
-            @inbounds dGatt[ij] = Inf
-            @inbounds probs[ij] = 0
-        else
-            @inbounds b = (ij[1]>1 ? m[ij[1]-1,ij[2]] : 0) + (ij[2]>1 ? m[ij[1],ij[2]-1] : 0) +
-                (ij[1]<size(m,1) ? m[ij[1]+1,ij[2]] : 0) + (ij[2]<size(m,2) ? m[ij[1],ij[2]+1] : 0)
-            if b == 0
-                @inbounds dGatt[ij] = Inf
-            else
-                @inbounds dGatt[ij] = (2 - b) * gse - ep - log(f[ij])
-            end
-            @inbounds probs[ij] = exp(-dGatt[ij])
-        end
-    end
-    return dGatt, probs
-end
-
-
-function fillFavorable_sl!(m, loc, gse, ep, f, dGatt, probs)
-    totaldG = 0
-    while true
-        didsomething = false
-        for offset = OFF4
-            ns = loc+offset
-            if (!checkbounds(Bool, dGatt, ns)) 
-                continue
-            end
-            if @inbounds dGatt[ns] < 0
-                loc = ns
-                @inbounds m[loc] = 1
-                @inbounds totaldG += dGatt[ns]
-                update_dGatt_and_probs_around!(dGatt, probs, ns, m, gse, ep, f)
-                didsomething = true
-                break
-            end
-        end
-        if !didsomething
-            break
-        end
-    end
-    return m, totaldG
-end
-
-function fillFavorable(m, loc, gse, ep, f, dGatt)
-    r = copy(m)
-    g2 = copy(dGatt)
-    return fillFavorable_sl!(r, loc, gse, ep, f, g2, similar(g2))
-end
-
-
-"""
-    probableStep!(m, gse, ep, f)
-
-Given an assembly `m` that *already has no favorable steps left* (not checked), of the
-unfavorable steps, of all steps, take step i with probability e^{-Delta G_i} / (sum_i e^{-Delta G_i).  
-Then add that step to `m`. Return `m` and the dG of the attachment.
-"""
-function probableStep!(m, gse, ep, f, dGatt, probs)
-    totalprob = sum(probs)
-    if totalprob == 0
-        return m, 0, dGatt, probs, CartesianIndex(-1, -1) #-1,-1 indicates no addition here.
-    end
-    r = totalprob * rand()
-    accum = 0
-    loc = CartesianIndex(-1, -1)
-    for ij in CartesianIndices(probs)
-        accum += probs[ij]
-        if accum >= r
-            loc = ij
-            break
-        end
-    end
-    dG = dGatt[loc]
-    m[loc] = 1
-    update_dGatt_and_probs_around!(dGatt, probs, loc, m, gse, ep, f)
-    return m, dG, dGatt, probs, loc
-end
-
-"""
-    lowInitStep!(m, gse, ep, f)
-
-Take the step that has the least dG.
-"""
-function lowInitStep!(m, gse, ep, f, dGatt)
-    ij = argmin(dGatt)
-    if dGatt[ij] == Inf
-        return m, 0
-    end
-    m[ij] = 1
-    return m, dGatt[ik], dGatt, loc
-end
-
-function lowInitLowFillStep(m, gse, ep, f, dGatt)
-    r = similar(m)
-    dGmin = Inf
-    dGfilledmin = Inf
-    loc = CartesianIndex(-1, -1)
-    for ij in CartesianIndices(m)
-        if dGatt[ij] == Inf
-            dG = Inf
-            continue
-        end
-        dG = dGatt[ij]
-        if dG <= dGmin
-            copyto!(r, m)
-            r[ij] = 1
-            mfilled, dGfilled = fillFavorable(r, ij, gse, ep, f, dGatt)
-            if (dG < dGmin) || (dGfilled < dGfilledmin)
-                dGfilledmin = dGfilled
-                dGmin = dG
-                loc = ij
-            end
-        end
-    end
-    if loc == CartesianIndex(-1, -1)
-        return m, 0
-    else
-        copyto!(r,m)
-        r[loc] = 1
-        dG = dGatt[loc]
-        dGatt = calc_dGatt(m, gse, ep, f)
-        return r, dG, dGatt, loc
-    end
-end
-
 function makeConcMap(map, flagtiles, sharedcodes, flagconc, sharedconc, uniqueconc)
     f = similar(map, Float64)
     for i in eachindex(map)
@@ -683,105 +659,5 @@ function makeConcMap(map, flagtiles, sharedcodes, flagconc, sharedconc, uniqueco
     end
     return f
 end
-
-
-function probableTrajectory_singlesite(loc, gse, ep, f, steps; checkmp=false,
-                                       cnar=Set{Array{Bool,2}}())
-    m = zeros(Bool, size(f))
-    Acrit = zeros(Bool, size(f))
-    Gcrit = -Inf
-    Gtrace = zeros(steps)
-    critstep = 1
-    
-    # Stop if there is no possible tile at the location
-    if f[loc] == 0
-        Gcrit = Inf
-        return Gcrit, m, Gtrace, Inf, Inf
-    end
-
-    m[loc] = true
-    Gtrace[1] = 2*gse - ep - log(f[loc])
-    Gtrace[2] = Gtrace[1] # We prefill this, then modify it with the next step.
-    dGatt = fill(Inf, size(m))
-    probs = zeros(size(dGatt))
-    update_dGatt_and_probs_around!(dGatt,probs,loc,m,gse,ep,f)
-    for step = 2:steps
-        m, dG, dGatt, probs, loc = probableStep!(m, gse, ep, f, dGatt, probs)
-
-        # loc = -1,-1 → no more steps possible
-        if loc == CartesianIndex(-1,-1)
-            break
-        end
-        
-        Gtrace[step] += dG
-
-        # mountain pass check
-        if checkmp
-            if m in cnar
-                return Inf, m, Gtrace, Inf, Gtrace[step]
-            end
-        end        
-        
-        if Gtrace[step] > Gcrit
-            Gcrit = Gtrace[step]
-            critstep = step
-            copyto!(Acrit, m)
-        end
-        m, dGfill = fillFavorable_sl!(m, loc, gse, ep, f, dGatt, probs)
-        if step < steps
-            Gtrace[step+1] = Gtrace[step] + dGfill # We prep the next site
-        end
-    end
-
-    return Gcrit, Acrit, Gtrace, critstep, Gcrit
-end
-
-function lowLowTrajectory_singlesite(loc, gse, ep, f, steps; checkmp=false,
-                                       cnar=Set{Array{Bool,2}}())
-    m = zeros(Bool, size(f))
-    Acrit = zeros(Bool, size(f))
-    Gcrit = -Inf
-    Gtrace = zeros(steps)
-    critstep = 1
-    
-    # Stop if there is no possible tile at the location
-    if f[loc] == 0
-        Gcrit = Inf
-        return Gcrit, m, Gtrace, Inf, Inf
-    end
-
-    m[loc] = true
-    Gtrace[1] = 2*gse - ep - log(f[loc])
-    Gtrace[2] = Gtrace[1] # We prefill this, then modify it with the next step.
-    dGatt = fill(Inf, size(m))
-    probs = zeros(size(dGatt))
-    dGatt = calc_dGatt(m, gse, ep, f)
-
-    for step = 2:steps
-        m, dG, dGatt, loc = lowInitLowFillStep(m, gse, ep, f, dGatt)
-        Gtrace[step] += dG
-
-        # mountain pass check
-        if checkmp
-            if m in cnar
-                return Inf, m, Gtrace, Inf, Gtrace[step]
-            end
-        end        
-        
-        if Gtrace[step] > Gcrit
-            Gcrit = Gtrace[step]
-            critstep = step
-            copyto!(Acrit, m)
-        end
-        m, dGfill = fillFavorable_sl!(m, loc, gse, ep, f, dGatt, probs)
-        if step < steps
-            Gtrace[step+1] = Gtrace[step] + dGfill # We prep the next site
-        end
-    end
-
-    return Gcrit, Acrit, Gtrace, critstep, Gcrit
-end
-
-
 
 end # module
