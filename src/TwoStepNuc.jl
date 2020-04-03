@@ -6,6 +6,7 @@ using StatsBase
 using Distributed
 using ImageFiltering
 import TinyClimbers
+import SHAM
 using DataStructures
 using Random
 using TinyClimbers
@@ -59,29 +60,43 @@ function choose_position(weights)
 end
 
 function probabilistic_gce(concarray::ConcArray, trials::Int64, p::KTAMParams,
-                           depth::Int64=typemax(Int64))
+                           depth::Int64=typemax(Int64); maxtrialsmult=10)
     # set of critical nuclei:
     found_cns = Array{FillArray,1}()
     found_Gcns = Float64[]
     found_traces = Array{Array{Float64,1},1}()
-    min_G_per_site = fill(Inf, size(concarray))
+    min_Gcn_per_site = fill(Inf, size(concarray))
 
     stoppedtrials = 0
+    goodtrials = 0
+    alltrials = 0
+    
+    maxtrials = maxtrialsmult * trials
 
-    for i in 1:trials
+    while (goodtrials < trials) & (alltrials < maxtrials)
         # Our starting site is chosen probabilistically based on concentration.
         starting_site = choose_position(concarray)
-
+        alltrials += 1
         # This will give us a new critical nucleus and trajectory, starting from
         # that site, or will fail, if it passes through a critical nucleus that
         # has already been found.
-        Gcn, cn, G_trace, crit_step = probable_trajectory(concarray, starting_site, p,
+        Gcn, cn, G_trace, crit_step, is_new_cn = probable_trajectory(concarray, starting_site, p,
                                                           found_cns,
                                                           depth)
 
-        # Gcn is returned as Inf if the trajectory passed through a previously-
-        # found critical nucleus.
-        if Gcn == Inf
+
+        # We store this regardless of whether it is a new critical nucleus.
+        # Note that alternatively, we could use the minimum of any critical
+        # nucleus containing the tile at a given site, which could be calculated
+        # after the fact.
+        if Gcn < min_Gcn_per_site[starting_site]
+            min_Gcn_per_site[starting_site] = Gcn
+        end
+        
+        # ~~~Gcn is returned as Inf if the trajectory passed through a previously-
+        # found critical nucleus.~~~
+        # No longer the case: now there is an is_new_cn
+        if !is_new_cn
             stoppedtrials += 1
             continue
         end
@@ -89,15 +104,25 @@ function probabilistic_gce(concarray::ConcArray, trials::Int64, p::KTAMParams,
         push!(found_Gcns, Gcn)
         push!(found_cns,  cn)
         push!(found_traces, G_trace)
+        goodtrials += 1
     end
 
-    Gce = -log(sum(exp.(-found_Gcns)))
+    #if alltrials >= maxtrials
+    #    println("Reached maxtrials.")
+    #end
+    
+    if length(found_Gcns) > 0
+        Gce = -log(sum(exp.(-found_Gcns)))
+    else
+        Gce = Inf
+    end
 
     # We will sort all our critical nuclei, so that the
     # most likely ones are first.
     sortkey = sortperm(found_Gcns)
     
-    return Gce, found_Gcns[sortkey], found_cns[sortkey], found_traces[sortkey], stoppedtrials/trials
+    return (gce=Gce, gcns=found_Gcns[sortkey], cns=found_cns[sortkey],
+            traces=found_traces[sortkey], stoppedpct=stoppedtrials/trials, gcnmap=min_Gcn_per_site)
 end
 
 function probable_trajectory(concmult, starting_site, p::KTAMParams,
@@ -117,7 +142,7 @@ function probable_trajectory(concmult, starting_site, p::KTAMParams,
     
     # Stop if the initial site has no tile there!
     if concmult[starting_site] == 0
-        return Inf, current_cn, trace, current_critstep
+        return Inf, current_cn, trace, current_critstep, false
     end
 
     # To start, add the initial tile to the state.
@@ -173,7 +198,7 @@ function probable_trajectory(concmult, starting_site, p::KTAMParams,
                     end
                 end
                 if !noteq
-                    return Inf, current_cn, trace, current_critstep
+                    return current_Gcn, current_cn, trace, current_critstep, false
                 end
             end
         end
@@ -197,7 +222,7 @@ function probable_trajectory(concmult, starting_site, p::KTAMParams,
         G += dG
     end
 
-    return current_Gcn, current_cn, trace, current_critstep
+    return current_Gcn, current_cn, trace, current_critstep, true
 end
 
 function probabilistic_step!(concmult, dGatt, probs, state, p)
@@ -363,31 +388,6 @@ function maketypes(cmaps...)
         println("Something is wrong!")
     end
     return typearray
-end
-
-function flag_concs(tiletypes::Array{Char,1}, flagtiles::Array{Int64,1},
-                    depletetypes::Array{Char}, baseconc::Float64,
-                    flagconc::Float64, deplete::Float64)
-    # Tiles start from 0, as in SHAM, so tiletypes[tilenum+1] = type of tilenum
-    concarray = fill(baseconc, size(tiletypes))
-    for tn in flagtiles
-        concarray[tn+1] = flagconc
-    end
-    
-    for ti in eachindex(tiletypes)
-        if tiletypes[ti] in depletetypes
-            concarray[ti] -= deplete
-        end
-    end
-
-    return concarray
-end
-
-function flag_concs(tiletypes, flagtiles::Array{String},
-                    depletetypes, baseconc,
-                    flagconc, deplete)
-    flagtiles_int = map(x -> parse(Int64, x[2:end]), flagtiles)
-    return flag_concs(tiletypes, flagtiles_int, depletetypes, baseconc, flagconc, deplete)
 end
 
 function make_hillflag(tiletypes, flagcodes, locmaps, nflagtiles, params, flagmult, boredmax)
