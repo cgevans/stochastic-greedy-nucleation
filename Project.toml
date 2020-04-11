@@ -6,6 +6,7 @@ version = "0.1.1"
 [deps]
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+GroupSlices = "d853e229-7c7c-56e9-b6be-9a1acc5f13d9"
 ImageFiltering = "6a3955dd-da59-5b1f-98d4-e7296123deb5"
 ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
