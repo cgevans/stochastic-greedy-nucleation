@@ -73,7 +73,7 @@ function probabilistic_gce(
     trials::Int64,
     p::KTAMParams,
     depth::Int64 = typemax(Int64);
-    maxtrialsmult = 10,
+    maxtrialsmult = 1,
     checkcns::Symbol = :after
 )
     # set of critical nuclei:
@@ -164,9 +164,15 @@ function probabilistic_gce(
         min_size_per_site[ij] = minimum(sizes[containing_cns])
         weight_size_per_site[ij] = sum(sizes[containing_cns] .* exp.(-gcnc)) / sum(exp.(-gcnc))
     end
+
+    if length(sizes) > 0
+        min_size = minimum(sizes)
+        weight_size = sum(sizes .* exp.(-found_Gcns)) / sum(exp.(-found_Gcns))
+    else
+        min_size = 1000
+        weight_size = 1000.0
+    end
     
-    min_size = minimum(sizes)
-    weight_size = sum(sizes .* exp.(-found_Gcns)) / sum(exp.(-found_Gcns))
     
     return (
         gce = Gce,
@@ -190,7 +196,8 @@ function probable_trajectory(
     p::KTAMParams,
     previous_cns::Array{FillArray,1},
     depth::Int64 = typemax(Int64),
-    checkcns = :after
+    checkcns = :after,
+    cutofftype = :belowstart
 )
 
     state = zeros(Bool, size(concmult))
@@ -235,6 +242,7 @@ function probable_trajectory(
         site, dG = probabilistic_step!(concmult, dGatt, probs, state, p)
 
         # loc = -1,-1 → no more steps were possible
+        # With vast depth, this is now the standard way of ending.
         if site == CartesianIndex(-1, -1)
             break
         end
@@ -288,7 +296,18 @@ function probable_trajectory(
         G += dG
     end
 
-    return current_Gcn, current_cn, trace, current_critstep, true
+    # We are now a the end of the trajectory.
+
+    if cutofftype == :belowstart
+        if G < trace[1]
+            return current_Gcn, current_cn, trace, current_critstep, true
+        else
+            return current_Gcn, current_cn, trace, current_critstep, false
+        end
+    else
+        return current_Gcn, current_cn, trace, current_critstep, true
+    end
+    
 end
 
 function probabilistic_step!(concmult, dGatt, probs, state, p)
