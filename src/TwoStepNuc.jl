@@ -9,7 +9,6 @@ import TinyClimbers
 import SHAM
 using DataStructures
 using Random
-using TinyClimbers
 using GroupSlices
 const OFF4 = [
     CartesianIndex(1, 0),
@@ -80,6 +79,8 @@ function probabilistic_gce(
     found_cns = Array{FillArray,1}()
     found_Gcns = Float64[]
     found_traces = Array{Array{Float64,1},1}()
+    size_traces = Array{Array{Int, 1}, 1}()
+    nucrates = Float64[]
     min_Gcn_per_site = fill(Inf, size(concarray))
     weight_Gcn_per_site = fill(Inf, size(concarray))    
     min_size_per_site = fill(Inf, size(concarray))
@@ -100,10 +101,10 @@ function probabilistic_gce(
         # that site, or will fail, if it passes through a critical nucleus that
         # has already been found.
         if checkcns == :during
-            Gcn, cn, G_trace, crit_step, is_new_cn =
+            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate =
                 probable_trajectory(concarray, starting_site, p, found_cns, depth, checkcns)
         else
-            Gcn, cn, G_trace, crit_step, is_new_cn =
+            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate =
                 probable_trajectory(concarray, starting_site, p, fake_cns, depth, checkcns)
         end
 
@@ -126,6 +127,8 @@ function probabilistic_gce(
         push!(found_Gcns, Gcn)
         push!(found_cns, cn)
         push!(found_traces, G_trace)
+        push!(nucrates, nucrate)
+        push!(size_traces, size_trace)
         goodtrials += 1
     end
 
@@ -134,6 +137,8 @@ function probabilistic_gce(
         found_Gcns = found_Gcns[inds]
         found_cns = found_cns[inds]
         found_traces = found_traces[inds]
+        size_traces = size_traces[inds]
+        nucrates = nucrates[inds]
     end
 
     #if alltrials >= maxtrials
@@ -177,8 +182,11 @@ function probabilistic_gce(
     return (
         gce = Gce,
         gcns = found_Gcns[sortkey],
+        nucrate = sum(nucrates[sortkey]),
+        nucrates = nucrates[sortkey],
         cns = found_cns[sortkey],
         traces = found_traces[sortkey],
+        size_traces = size_traces[sortkey],
         stoppedpct = stoppedtrials / trials,
         ncns = length(found_cns),
         min_Gcn_per_site = min_Gcn_per_site,
@@ -205,6 +213,7 @@ function probable_trajectory(
     current_cn = zeros(Bool, size(concmult))
     current_Gcn = -Inf
     current_critstep = 1
+    current_frate = 0
 
     if checkcns == :during
     # keeps track of whether the state could, by an arbitrary series
@@ -213,14 +222,16 @@ function probable_trajectory(
     end
     
     trace = Float64[]
+    size_trace = Int64[]
 
     # Stop if the initial site has no tile there!
     if concmult[starting_site] == 0
-        return Inf, current_cn, trace, current_critstep, false
+        return Inf, current_cn, trace, current_critstep, false, size_trace, current_frate
     end
 
     # To start, add the initial tile to the state.
     state[starting_site] = true
+    statesize = 1
 
     # We include alpha here, because not including it is
     # really confusing.  Every tile attachment doesn't include it,
@@ -231,6 +242,7 @@ function probable_trajectory(
     # for both the single tile, and all future assemblies.
     G = G_mc(p) - alpha(p) - log(concmult[starting_site])
     push!(trace, G)
+    push!(size_trace, statesize) 
 
     stepnum = 2
 
@@ -240,7 +252,7 @@ function probable_trajectory(
 
     while stepnum <= depth
         site, dG = probabilistic_step!(concmult, dGatt, probs, state, p)
-
+        statesize += 1
         # loc = -1,-1 → no more steps were possible
         # With vast depth, this is now the standard way of ending.
         if site == CartesianIndex(-1, -1)
@@ -281,6 +293,7 @@ function probable_trajectory(
         # we're actually in a new state.  Update stuff:
         G += dG
         push!(trace, G)
+        push!(size_trace, statesize)
 
         # Are we in a state of higher G than we've seen before?
         # If so, that seems like our new best guess of critical
@@ -289,10 +302,17 @@ function probable_trajectory(
             current_Gcn = G
             current_critstep = stepnum
             copyto!(current_cn, state)
+            is_current_critnuc = true
+        else
+            is_current_critnuc = false
         end
 
         # Fill the state with dG<0 steps.
-        dG = fillFavorable_sl!(concmult, dGatt, probs, state, site, p)
+        dG, frate, ntiles = fillFavorable_sl!(concmult, dGatt, probs, state, site, p, is_current_critnuc)
+        statesize += ntiles
+        if is_current_critnuc
+            current_frate = frate * exp(-current_Gcn)
+        end
         G += dG
     end
 
@@ -300,12 +320,12 @@ function probable_trajectory(
 
     if cutofftype == :belowstart
         if G < trace[1]
-            return current_Gcn, current_cn, trace, current_critstep, true
+            return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate
         else
-            return current_Gcn, current_cn, trace, current_critstep, false
+            return current_Gcn, current_cn, trace, current_critstep, false, size_trace, current_frate
         end
     else
-        return current_Gcn, current_cn, trace, current_critstep, true
+        return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate
     end
     
 end
@@ -360,8 +380,26 @@ function update_dGatt_and_probs_around!(concmult, dGatt, probs, state, loc, p)
     end
 end
 
-function fillFavorable_sl!(concmult, dGatt, probs, state, loc, p)
+function fillFavorable_sl!(concmult, dGatt, probs, state, loc, p, is_current_critnuc::Bool)
     totaldG = 0
+
+    # Note: dGatt and probs must be current here!  They are updated by probabilistic_step! .
+
+    # Potential forward sites have dGatt < 0.  They can only be adjacent to the location.
+    frate = 0
+    if is_current_critnuc
+        for offset in OFF4
+            trialsite = loc + offset            
+            if (!checkbounds(Bool, dGatt, trialsite))
+                continue
+            end
+            if dGatt[trialsite] < 0
+                frate += k_f(p) * exp(-G_mc(p) + alpha(p))
+            end
+        end
+    end
+
+    ntiles = 0
     while true
         didsomething = false
         # The only place we might have new dG<0 steps is
@@ -379,6 +417,7 @@ function fillFavorable_sl!(concmult, dGatt, probs, state, loc, p)
             if @inbounds (dG = dGatt[trialsite]) < 0
                 loc = trialsite
                 @inbounds state[loc] = true
+                ntiles += 1
                 @inbounds totaldG += dG
                 update_dGatt_and_probs_around!(concmult, dGatt, probs, state, loc, p)
                 didsomething = true
@@ -389,7 +428,7 @@ function fillFavorable_sl!(concmult, dGatt, probs, state, loc, p)
             break
         end
     end
-    return totaldG
+    return totaldG, frate, ntiles
 end
 
 function N(m)
@@ -662,14 +701,14 @@ function pattern_match_TC(
     if length(allowedtiles) > length(images[1])
         println("Oh dear")
     end
-    if (initassign == nothing) && (!rightblank)
+    if (initassign === nothing) && (!rightblank)
         assignmap = fill(-1, size(images[1]))
         initplaces =
             sample(CartesianIndices(assignmap), length(allowedtiles), replace = false)
         for i in eachindex(initplaces)
             assignmap[initplaces[i]] = allowedtiles[i]
         end
-    elseif (initassign == nothing) && rightblank
+    elseif (initassign === nothing) && rightblank
         assignmap = fill(-1, size(images[1]))
         shuffle!(allowedtiles)
         for (at, ix) in zip(allowedtiles, CartesianIndices(assignmap))
@@ -717,14 +756,14 @@ function pattern_match_TC_window_new(
     if length(allowedtiles) > length(images[1])
         println("Oh dear")
     end
-    if (initassign == nothing) && (!rightblank)
+    if (initassign === nothing) && (!rightblank)
         assignmap = fill(-1, size(images[1]))
         initplaces =
             sample(CartesianIndices(assignmap), length(allowedtiles), replace = false)
         for i in eachindex(initplaces)
             assignmap[initplaces[i]] = allowedtiles[i]
         end
-    elseif (initassign == nothing) && rightblank
+    elseif (initassign === nothing) && rightblank
         assignmap = fill(-1, size(images[1]))
         shuffle!(allowedtiles)
         for (at, ix) in zip(allowedtiles, CartesianIndices(assignmap))
@@ -781,79 +820,79 @@ function swap_fix_m1!(value::Array)
     end
 end
 
-function makeflag_fastmodel(
-    tiletypes,
-    usecodes,
-    locmaps,
-    nhigh,
-    chigh;
-    initallowed::Union{Nothing,Array{Int64,1}} = nothing,
-    kval = 5,
-    sn = 1,
-    nworkers = 1,
-)
+# function makeflag_fastmodel(
+#     tiletypes,
+#     usecodes,
+#     locmaps,
+#     nhigh,
+#     chigh;
+#     initallowed::Union{Nothing,Array{Int64,1}} = nothing,
+#     kval = 5,
+#     sn = 1,
+#     nworkers = 1,
+# )
 
-    if initallowed == nothing
-        initallowed = findall(x -> x in usecodes, tiletypes)
-        shuffle!(initallowed)
-    end
-    al = copy(initallowed) # copy to avoid modifying input initcl
+#     if initallowed === nothing
+#         initallowed = findall(x -> x in usecodes, tiletypes)
+#         shuffle!(initallowed)
+#     end
+#     al = copy(initallowed) # copy to avoid modifying input initcl
 
-    ntiles = length(tiletypes)
+#     ntiles = length(tiletypes)
 
-    mr = TinyClimbers.MountainRange(
-        x -> partswap!(x, nhigh),
-        (x, y) -> doswap!(x, y),
-        x -> flag_meas_window_new(x, nhigh, chigh, ntiles, locmaps, kval),
-    )
+#     mr = TinyClimbers.MountainRange(
+#         x -> partswap!(x, nhigh),
+#         (x, y) -> doswap!(x, y),
+#         x -> flag_meas_window_new(x, nhigh, chigh, ntiles, locmaps, kval),
+#     )
 
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
+#     r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
 
-    return r
-end
+#     return r
+# end
 
-function makeflag_goodmodel(
-    tiletypes,
-    usecodes,
-    locmaps,
-    nhigh,
-    chigh,
-    params;
-    initallowed::Union{Nothing,Array{Int64,1}} = nothing,
-    kval = 5,
-    sn = 1,
-    nworkers = 1,
-    trialsperpoint = 300,
-    depth = 14,
-)
+# function makeflag_goodmodel(
+#     tiletypes,
+#     usecodes,
+#     locmaps,
+#     nhigh,
+#     chigh,
+#     params;
+#     initallowed::Union{Nothing,Array{Int64,1}} = nothing,
+#     kval = 5,
+#     sn = 1,
+#     nworkers = 1,
+#     trialsperpoint = 300,
+#     depth = 14,
+# )
 
-    if initallowed == nothing
-        initallowed = findall(x -> x in usecodes, tiletypes)
-        shuffle!(initallowed)
-    end
-    al = copy(initallowed) # copy to avoid modifying input initcl
+#     if initallowed === nothing
+#         initallowed = findall(x -> x in usecodes, tiletypes)
+#         shuffle!(initallowed)
+#     end
+#     al = copy(initallowed) # copy to avoid modifying input initcl
 
-    ntiles = length(tiletypes)
+#     ntiles = length(tiletypes)
 
-    mr = TinyClimbers.MountainRange(
-        x -> partswap!(x, nhigh),
-        (x, y) -> doswap!(x, y),
-        x -> flag_meas_twostep_new(
-            x,
-            nhigh,
-            chigh,
-            ntiles,
-            locmaps,
-            depth,
-            trialsperpoint,
-            params,
-        ),
-    )
+#     mr = TinyClimbers.MountainRange(
+#         x -> partswap!(x, nhigh),
+#         (x, y) -> doswap!(x, y),
+#         x -> flag_meas_twostep_new(
+#             x,
+#             nhigh,
+#             chigh,
+#             ntiles,
+#             locmaps,
+#             depth,
+#             trialsperpoint,
+#             params,
+#         ),
+#     )
 
-    r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
+#     r = TinyClimbers.hillclimb_paranoidclimbers(mr, al, nworkers)
 
-    return r
-end
+#     return r
+# end
 
 function makeConcMap(map, flagtiles, sharedcodes, flagconc, sharedconc, uniqueconc)
     f = similar(map, Float64)
