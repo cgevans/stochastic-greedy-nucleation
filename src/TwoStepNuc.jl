@@ -83,6 +83,7 @@ function probabilistic_gce(
     nucrates = Float64[]
     min_Gcn_per_site = fill(Inf, size(concarray))
     weight_Gcn_per_site = fill(Inf, size(concarray))    
+    nucrate_per_site = fill(NaN, size(concarray))    
     min_size_per_site = fill(Inf, size(concarray))
     weight_size_per_site = fill(Inf, size(concarray))
     fake_cns = Array{FillArray,1}()
@@ -166,6 +167,7 @@ function probabilistic_gce(
         gcnc = found_Gcns[containing_cns]
         min_Gcn_per_site[ij] = minimum(gcnc)
         weight_Gcn_per_site[ij] = sum(gcnc .* exp.(-gcnc)) / sum(exp.(-gcnc))
+        nucrate_per_site[ij] = sum( nucrates[containing_cns] ./ sizes[containing_cns] )
         min_size_per_site[ij] = minimum(sizes[containing_cns])
         weight_size_per_site[ij] = sum(sizes[containing_cns] .* exp.(-gcnc)) / sum(exp.(-gcnc))
     end
@@ -193,6 +195,7 @@ function probabilistic_gce(
         weight_Gcn_per_site = weight_Gcn_per_site,
         min_size_per_site = min_size_per_site,
         weight_size_per_site = weight_size_per_site,
+        nucrate_per_site = nucrate_per_site,
         min_size = min_size,
         weight_size = weight_size
     )
