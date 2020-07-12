@@ -73,7 +73,8 @@ function probabilistic_gce(
     p::KTAMParams,
     depth::Int64 = typemax(Int64);
     maxtrialsmult = 1,
-    checkcns::Symbol = :after
+    checkcns::Symbol = :after,
+    cutofftype::Symbol = :belowstart
 )
     # set of critical nuclei:
     found_cns = Array{FillArray,1}()
@@ -81,6 +82,7 @@ function probabilistic_gce(
     found_traces = Array{Array{Float64,1},1}()
     size_traces = Array{Array{Int, 1}, 1}()
     nucrates = Float64[]
+    hoprates = Float64[]
     min_Gcn_per_site = fill(Inf, size(concarray))
     weight_Gcn_per_site = fill(Inf, size(concarray))    
     nucrate_per_site = fill(NaN, size(concarray))    
@@ -102,11 +104,11 @@ function probabilistic_gce(
         # that site, or will fail, if it passes through a critical nucleus that
         # has already been found.
         if checkcns == :during
-            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate =
-                probable_trajectory(concarray, starting_site, p, found_cns, depth, checkcns)
+            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate =
+                probable_trajectory(concarray, starting_site, p, found_cns, depth, checkcns, cutofftype=cutofftype)
         else
-            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate =
-                probable_trajectory(concarray, starting_site, p, fake_cns, depth, checkcns)
+            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate =
+                probable_trajectory(concarray, starting_site, p, fake_cns, depth, checkcns, cutofftype=cutofftype)
         end
 
         # We store this regardless of whether it is a new critical nucleus.
@@ -129,6 +131,7 @@ function probabilistic_gce(
         push!(found_cns, cn)
         push!(found_traces, G_trace)
         push!(nucrates, nucrate)
+        push!(hoprates, hoprate)
         push!(size_traces, size_trace)
         goodtrials += 1
     end
@@ -140,6 +143,7 @@ function probabilistic_gce(
         found_traces = found_traces[inds]
         size_traces = size_traces[inds]
         nucrates = nucrates[inds]
+        hoprates = hoprates[inds]
     end
 
     #if alltrials >= maxtrials
@@ -185,7 +189,9 @@ function probabilistic_gce(
         gce = Gce,
         gcns = found_Gcns[sortkey],
         nucrate = sum(nucrates[sortkey]),
+        hoprate = sum(hoprates[sortkey]),
         nucrates = nucrates[sortkey],
+        hoprates = hoprates[sortkey],
         cns = found_cns[sortkey],
         traces = found_traces[sortkey],
         size_traces = size_traces[sortkey],
@@ -207,7 +213,7 @@ function probable_trajectory(
     p::KTAMParams,
     previous_cns::Array{FillArray,1},
     depth::Int64 = typemax(Int64),
-    checkcns = :after,
+    checkcns = :after;
     cutofftype = :belowstart
 )
 
@@ -217,6 +223,7 @@ function probable_trajectory(
     current_Gcn = -Inf
     current_critstep = 1
     current_frate = 0
+    current_hoprate = 0
 
     if checkcns == :during
     # keeps track of whether the state could, by an arbitrary series
@@ -229,7 +236,7 @@ function probable_trajectory(
 
     # Stop if the initial site has no tile there!
     if concmult[starting_site] == 0
-        return Inf, current_cn, trace, current_critstep, false, size_trace, current_frate
+        return Inf, current_cn, trace, current_critstep, false, size_trace, current_frate, current_hoprate
     end
 
     # To start, add the initial tile to the state.
@@ -261,39 +268,11 @@ function probable_trajectory(
         if site == CartesianIndex(-1, -1)
             break
         end
-
-        # break if we are in a state that was in previous_cns.
-        # But we'll be smart here.  There's no point in checking equality if
-        # a previous state (we're like the aTAM here with no detachments) had a
-        # tile in a place where the CN we're comparing with didn't.  So we'll
-        # keep track of this, and save ourselves quite a bit of time.
-        #if state in previous_cns
-        #    return Inf, current_cn, trace, current_critstep
-        #end
-        if checkcns == :during
-        for i in eachindex(could_become_previous_cns)
-            noteq = false
-            if !could_become_previous_cns[i]
-                continue
-            else
-                for loc in eachindex(state)
-                    if state[loc] & (!previous_cns[i][loc])
-                        could_become_previous_cns[i] = false
-                        noteq = true
-                        break
-                    elseif (!state[loc]) & (previous_cns[i][loc])
-                        noteq = true
-                    end
-                end
-                if !noteq
-                    return current_Gcn, current_cn, trace, current_critstep, false
-                end
-            end
-        end
-        end
         
 
         # we're actually in a new state.  Update stuff:
+        oldG = G
+        pdG = dG
         G += dG
         push!(trace, G)
         push!(size_trace, statesize)
@@ -315,6 +294,9 @@ function probable_trajectory(
         statesize += ntiles
         if is_current_critnuc
             current_frate = frate * exp(-current_Gcn)
+            dgsetot_of_prob = pdG - G_mc(p) - log(concmult[site])
+            rrate = k_f(p) * exp(alpha(p)) * exp(dgsetot_of_prob)
+            current_hoprate = k_f(p)*exp(-oldG - G_mc(p) + alpha(p) + log(concmult[site]))*(frate)/(frate+rrate)
         end
         G += dG
     end
@@ -323,12 +305,12 @@ function probable_trajectory(
 
     if cutofftype == :belowstart
         if G < trace[1]
-            return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate
+            return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate
         else
-            return current_Gcn, current_cn, trace, current_critstep, false, size_trace, current_frate
+            return current_Gcn, current_cn, trace, current_critstep, false, size_trace, current_frate, current_hoprate
         end
     else
-        return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate
+        return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate
     end
     
 end
