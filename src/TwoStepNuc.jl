@@ -74,8 +74,12 @@ function probabilistic_gce(
     depth::Int64 = typemax(Int64);
     maxtrialsmult = 1,
     checkcns::Symbol = :after,
-    cutofftype::Symbol = :belowstart
+    cutofftype::Symbol = :belowstart,
+    calc_weightsize_G = false,
+    store_assemblies = false
 )
+    maxsize = sum(concarray .> 0)
+
     # set of critical nuclei:
     found_cns = Array{FillArray,1}()
     found_Gcns = Float64[]
@@ -89,12 +93,21 @@ function probabilistic_gce(
     min_size_per_site = fill(Inf, size(concarray))
     weight_size_per_site = fill(Inf, size(concarray))
     fake_cns = Array{FillArray,1}()
-    
+    sized_assemblies = [[] for _ in range(1, maxsize)]
+    sized_assembly_Gs = [[] for _ in range(1, maxsize)]
+    assembly_traces = []
+
     stoppedtrials = 0
     goodtrials = 0
     alltrials = 0
 
     maxtrials = maxtrialsmult * trials
+
+    # Find the final G
+    finalG = G(concarray, concarray .> 0, p)
+    baseG = G_mc(p) - alpha(p)
+
+    return_assemblies = calc_weightsize_G | store_assemblies
 
     while (goodtrials < trials) & (alltrials < maxtrials)
         # Our starting site is chosen probabilistically based on concentration.
@@ -104,11 +117,11 @@ function probabilistic_gce(
         # that site, or will fail, if it passes through a critical nucleus that
         # has already been found.
         if checkcns == :during
-            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate =
-                probable_trajectory(concarray, starting_site, p, found_cns, depth, checkcns, cutofftype=cutofftype)
+            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate, assemblies =
+                probable_trajectory(concarray, starting_site, p, found_cns, depth, checkcns, cutofftype=cutofftype, store_assemblies=return_assemblies)
         else
-            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate =
-                probable_trajectory(concarray, starting_site, p, fake_cns, depth, checkcns, cutofftype=cutofftype)
+            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate, assemblies =
+                probable_trajectory(concarray, starting_site, p, fake_cns, depth, checkcns, cutofftype=cutofftype, store_assemblies=return_assemblies)
         end
 
         # We store this regardless of whether it is a new critical nucleus.
@@ -118,6 +131,18 @@ function probabilistic_gce(
         #if Gcn < min_Gcn_per_site[starting_site]
         #    min_Gcn_per_site[starting_site] = Gcn
         #end
+
+        # We store, if we are storing, sized assemblies regardless of whether we found
+        # a new critical nucleus.
+        if calc_weightsize_G
+            for k in range(1, length(assemblies))
+                if assemblies[k] in sized_assemblies[k]
+                    continue
+                end
+                push!(sized_assemblies[size_trace[k]], assemblies[k])
+                push!(sized_assembly_Gs[size_trace[k]], G_trace[k])
+            end
+        end
 
         # ~~~Gcn is returned as Inf if the trajectory passed through a previously-
         # found critical nucleus.~~~
@@ -133,6 +158,9 @@ function probabilistic_gce(
         push!(nucrates, nucrate)
         push!(hoprates, hoprate)
         push!(size_traces, size_trace)
+        if store_assemblies
+            push!(assembly_traces, assemblies)
+        end
         goodtrials += 1
     end
 
@@ -144,6 +172,9 @@ function probabilistic_gce(
         size_traces = size_traces[inds]
         nucrates = nucrates[inds]
         hoprates = hoprates[inds]
+        if store_assemblies
+            assembly_traces = assembly_traces[inds]
+        end
     end
 
     #if alltrials >= maxtrials
@@ -177,13 +208,27 @@ function probabilistic_gce(
     end
 
     if length(sizes) > 0
-        min_size = minimum(sizes)
+        min_size = minimum(sizes)   
         weight_size = sum(sizes .* exp.(-found_Gcns)) / sum(exp.(-found_Gcns))
     else
         min_size = 1000
         weight_size = 1000.0
     end
     
+    weightsizeG = fill(NaN, maxsize)
+    numsized = fill(NaN, maxsize)
+
+    if calc_weightsize_G
+        for i in range(1, maxsize)
+            numsized[i] = sized_assembly_Gs[i] |> length
+            if numsized[i] == 0
+                continue
+            end
+            Gs = sized_assembly_Gs[i]
+            Z = sum(exp.(-Gs))
+            weightsizeG[i] = sum(Gs .* exp.(-Gs)) / Z
+        end
+    end
     
     return (
         gce = Gce,
@@ -203,7 +248,12 @@ function probabilistic_gce(
         weight_size_per_site = weight_size_per_site,
         nucrate_per_site = nucrate_per_site,
         min_size = min_size,
-        weight_size = weight_size
+        weight_size = weight_size,
+        finalG = finalG,
+        baseG = baseG,
+        num_per_size = numsized,
+        G_weighted_per_size = weightsizeG,
+        assembly_traces = store_assemblies ? assembly_traces[sortkey] : []
     )
 end
 
@@ -214,7 +264,8 @@ function probable_trajectory(
     previous_cns::Array{FillArray,1},
     depth::Int64 = typemax(Int64),
     checkcns = :after;
-    cutofftype = :belowstart
+    cutofftype = :belowstart,
+    store_assemblies = false
 )
 
     state = zeros(Bool, size(concmult))
@@ -224,6 +275,8 @@ function probable_trajectory(
     current_critstep = 1
     current_frate = 0
     current_hoprate = 0
+
+    assemblies = []
 
     if checkcns == :during
     # keeps track of whether the state could, by an arbitrary series
@@ -276,6 +329,9 @@ function probable_trajectory(
         G += dG
         push!(trace, G)
         push!(size_trace, statesize)
+        if store_assemblies
+            push!(assemblies, copy(state))
+        end
 
         # Are we in a state of higher G than we've seen before?
         # If so, that seems like our new best guess of critical
@@ -305,12 +361,12 @@ function probable_trajectory(
 
     if cutofftype == :belowstart
         if G < trace[1]
-            return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate
+            return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate, assemblies
         else
-            return current_Gcn, current_cn, trace, current_critstep, false, size_trace, current_frate, current_hoprate
+            return current_Gcn, current_cn, trace, current_critstep, false, size_trace, current_frate, current_hoprate, assemblies
         end
     else
-        return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate
+        return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate, assemblies
     end
     
 end
