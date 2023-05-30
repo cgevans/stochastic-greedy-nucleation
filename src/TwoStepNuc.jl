@@ -28,7 +28,7 @@ const OFF5 = [
 const LocationArray = Array{Int64,2}
 const ConcList = Array{Float64,1}
 const ConcArray = Array{Float64,2}
-const FillArray = Array{Bool,2}
+const FillArray = BitArray
 
 struct KTAMParams
     gmc::Float64
@@ -67,18 +67,20 @@ function choose_position(weights)
     return choose_position_presummed(weights, full_val)
 end
 
+
+"""
+Run the SGM for fixed parameters and concentration multiple array, for a fixed
+number of trials.
+"""
 function probabilistic_gce(
-    concarray::ConcArray,
+    farray::ConcArray,
     trials::Int64,
     p::KTAMParams,
     depth::Int64 = typemax(Int64);
-    maxtrialsmult = 1,
-    checkcns::Symbol = :after,
-    cutofftype::Symbol = :belowstart,
     calc_weightsize_G = false,
     store_assemblies = false
 )
-    maxsize = sum(concarray .> 0)
+    maxsize = sum(farray .> 0)
 
     # set of critical nuclei:
     found_cns = Array{FillArray,1}()
@@ -86,100 +88,70 @@ function probabilistic_gce(
     found_traces = Array{Array{Float64,1},1}()
     size_traces = Array{Array{Int, 1}, 1}()
     nucrates = Float64[]
-    hoprates = Float64[]
-    min_Gcn_per_site = fill(Inf, size(concarray))
-    weight_Gcn_per_site = fill(Inf, size(concarray))    
-    nucrate_per_site = fill(NaN, size(concarray))    
-    min_size_per_site = fill(Inf, size(concarray))
-    weight_size_per_site = fill(Inf, size(concarray))
-    fake_cns = Array{FillArray,1}()
+    min_Gcn_per_site = fill(Inf, size(farray))
+    weight_Gcn_per_site = fill(Inf, size(farray))    
+    nucrate_per_site = fill(NaN, size(farray))    
+    min_size_per_site = fill(Inf, size(farray))
+    weight_size_per_site = fill(Inf, size(farray))
     sized_assemblies = [[] for _ in range(1, maxsize)]
     sized_assembly_Gs = [[] for _ in range(1, maxsize)]
     assembly_traces = []
 
     stoppedtrials = 0
     goodtrials = 0
-    alltrials = 0
-
-    maxtrials = maxtrialsmult * trials
+    finished_trials = 0
 
     # Find the final G
-    finalG = G(concarray, concarray .> 0, p)
+    finalG = G(farray, farray .> 0, p)
     baseG = G_mc(p) - alpha(p)
 
     return_assemblies = calc_weightsize_G | store_assemblies
 
-    while (goodtrials < trials) & (alltrials < maxtrials)
+    while finished_trials < trials
         # Our starting site is chosen probabilistically based on concentration.
-        starting_site = choose_position(concarray)
-        alltrials += 1
+        starting_site = choose_position(farray)
         # This will give us a new critical nucleus and trajectory, starting from
         # that site, or will fail, if it passes through a critical nucleus that
         # has already been found.
-        if checkcns == :during
-            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate, assemblies =
-                probable_trajectory(concarray, starting_site, p, found_cns, depth, checkcns, cutofftype=cutofftype, store_assemblies=return_assemblies)
-        else
-            Gcn, cn, G_trace, crit_step, is_new_cn, size_trace, nucrate, hoprate, assemblies =
-                probable_trajectory(concarray, starting_site, p, fake_cns, depth, checkcns, cutofftype=cutofftype, store_assemblies=return_assemblies)
-        end
 
-        # We store this regardless of whether it is a new critical nucleus.
-        # Note that alternatively, we could use the minimum of any critical
-        # nucleus containing the tile at a given site, which could be calculated
-        # after the fact.
-        #if Gcn < min_Gcn_per_site[starting_site]
-        #    min_Gcn_per_site[starting_site] = Gcn
-        #end
+        out = probable_trajectory(farray, starting_site, p, depth, store_assemblies=return_assemblies)
+        
+        finished_trials += 1
 
         # We store, if we are storing, sized assemblies regardless of whether we found
         # a new critical nucleus.
         if calc_weightsize_G
-            for k in range(1, length(assemblies))
-                if assemblies[k] in sized_assemblies[k]
+            for k in range(1, length(out.assemblies))
+                if out.assemblies[k] in sized_assemblies[k]
                     continue
                 end
-                push!(sized_assemblies[size_trace[k]], assemblies[k])
-                push!(sized_assembly_Gs[size_trace[k]], G_trace[k])
+                push!(sized_assemblies[size_trace[k]], out.assemblies[k])
+                push!(sized_assembly_Gs[size_trace[k]], out.G_trace[k])
             end
         end
 
-        # ~~~Gcn is returned as Inf if the trajectory passed through a previously-
-        # found critical nucleus.~~~
-        # No longer the case: now there is an is_new_cn
-        if !is_new_cn
-            stoppedtrials += 1
-            continue
-        end
-
-        push!(found_Gcns, Gcn)
-        push!(found_cns, cn)
-        push!(found_traces, G_trace)
-        push!(nucrates, nucrate)
-        push!(hoprates, hoprate)
-        push!(size_traces, size_trace)
+        push!(found_Gcns, out.Gcn)
+        push!(found_cns, out.cn)
+        push!(found_traces, out.G_trace)
+        push!(nucrates, out.nucrate)
+        push!(size_traces, out.size_trace)
         if store_assemblies
-            push!(assembly_traces, assemblies)
+            push!(assembly_traces, out.assemblies)
         end
         goodtrials += 1
     end
 
-    if checkcns == :after
-        inds = firstinds(groupslices(found_cns))
-        found_Gcns = found_Gcns[inds]
-        found_cns = found_cns[inds]
-        found_traces = found_traces[inds]
-        size_traces = size_traces[inds]
-        nucrates = nucrates[inds]
-        hoprates = hoprates[inds]
-        if store_assemblies
-            assembly_traces = assembly_traces[inds]
-        end
+    # Check for duplicate critical nuclei, and remove them.
+    inds = firstinds(groupslices(found_cns))
+    found_Gcns = found_Gcns[inds]
+    found_cns = found_cns[inds]
+    found_traces = found_traces[inds]
+    size_traces = size_traces[inds]
+    nucrates = nucrates[inds]
+    if store_assemblies
+        assembly_traces = assembly_traces[inds]
     end
-
-    #if alltrials >= maxtrials
-    #    println("Reached maxtrials.")
-    #end
+    
 
     if length(found_Gcns) > 0
         Gce = -log(sum(exp.(-found_Gcns)))
@@ -234,9 +206,7 @@ function probabilistic_gce(
         gce = Gce,
         gcns = found_Gcns[sortkey],
         nucrate = sum(nucrates[sortkey]),
-        hoprate = sum(hoprates[sortkey]),
         nucrates = nucrates[sortkey],
-        hoprates = hoprates[sortkey],
         cns = found_cns[sortkey],
         traces = found_traces[sortkey],
         size_traces = size_traces[sortkey],
@@ -257,39 +227,34 @@ function probabilistic_gce(
     )
 end
 
+"""
+Calculate a single SGM trajectory, for a concentration multiple array `farray`, starting from position
+`starting_site`, with parameters `p`, going up to `max_steps` steps.  If `store_assemblies`, then also
+return all the assemblies along the trajectory.
+"""
 function probable_trajectory(
-    concmult,
+    farray::ConcArray,
     starting_site,
     p::KTAMParams,
-    previous_cns::Array{FillArray,1},
-    depth::Int64 = typemax(Int64),
-    checkcns = :after;
-    cutofftype = :belowstart,
-    store_assemblies = false
+    max_steps::Int64 = typemax(Int64);
+    store_assemblies::Bool = false
 )
 
-    state = zeros(Bool, size(concmult))
+    state = falses(size(farray))
 
-    current_cn = zeros(Bool, size(concmult))
+    current_cn = falses(size(farray))
     current_Gcn = -Inf
     current_critstep = 1
     current_frate = 0
-    current_hoprate = 0
 
     assemblies = []
-
-    if checkcns == :during
-    # keeps track of whether the state could, by an arbitrary series
-    # of additions,z become previous_cns[i]
-    could_become_previous_cns = ones(Bool, length(previous_cns))
-    end
     
     trace = Float64[]
     size_trace = Int64[]
 
     # Stop if the initial site has no tile there!
-    if concmult[starting_site] == 0
-        return Inf, current_cn, trace, current_critstep, false, size_trace, current_frate, current_hoprate
+    if farray[starting_site] == 0
+        return (Gcn = Inf, cn = current_cn, G_trace = trace, crit_step = current_critstep, size_trace = size_trace, nucrate = current_frate, assemblies=assemblies)
     end
 
     # To start, add the initial tile to the state.
@@ -303,18 +268,18 @@ function probable_trajectory(
     # included, we need to compensate for it.
     # This means we have $[c]_{eq} = u_0 e^{-G}$, as we would expect,
     # for both the single tile, and all future assemblies.
-    G = G_mc(p) - alpha(p) - log(concmult[starting_site])
+    G = G_mc(p) - alpha(p) - log(farray[starting_site])
     push!(trace, G)
     push!(size_trace, statesize) 
 
     stepnum = 2
 
-    dGatt = fill(Inf, size(concmult))
+    dGatt = fill(Inf, size(farray))
     probs = zeros(size(dGatt))
-    update_dGatt_and_probs_around!(concmult, dGatt, probs, state, starting_site, p)
+    update_dGatt_and_probs_around!(farray, dGatt, probs, state, starting_site, p)
 
-    while stepnum <= depth
-        site, dG = probabilistic_step!(concmult, dGatt, probs, state, p)
+    while stepnum <= max_steps
+        site, dG = probabilistic_step!(farray, dGatt, probs, state, p)
         statesize += 1
         # loc = -1,-1 → no more steps were possible
         # With vast depth, this is now the standard way of ending.
@@ -346,32 +311,28 @@ function probable_trajectory(
         end
 
         # Fill the state with dG<0 steps.
-        dG, frate, ntiles = fillFavorable_sl!(concmult, dGatt, probs, state, site, p, is_current_critnuc)
+        dG, frate, ntiles = fillFavorable_sl!(farray, dGatt, probs, state, site, p, is_current_critnuc)
         statesize += ntiles
         if is_current_critnuc
             current_frate = frate * exp(-current_Gcn)
-            dgsetot_of_prob = pdG - G_mc(p) - log(concmult[site])
+            dgsetot_of_prob = pdG - G_mc(p) - log(farray[site])
             rrate = k_f(p) * exp(alpha(p)) * exp(dgsetot_of_prob)
-            current_hoprate = k_f(p)*exp(-oldG - G_mc(p) + alpha(p) + log(concmult[site]))*(frate)/(frate+rrate)
         end
         G += dG
     end
 
     # We are now a the end of the trajectory.
 
-    if cutofftype == :belowstart
-        if G < trace[1]
-            return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate, assemblies
-        else
-            return current_Gcn, current_cn, trace, current_critstep, false, size_trace, current_frate, current_hoprate, assemblies
-        end
-    else
-        return current_Gcn, current_cn, trace, current_critstep, true, size_trace, current_frate, current_hoprate, assemblies
-    end
-    
+    return (Gcn = current_Gcn, 
+            cn = current_cn, 
+            G_trace = trace, 
+            crit_step = current_critstep, 
+            size_trace = size_trace,
+            nucrate = current_frate,
+            assemblies = assemblies)
 end
 
-function probabilistic_step!(concmult, dGatt, probs, state, p)
+function probabilistic_step!(farray::Array{Float64, 2}, dGatt::Array{Float64, 2}, probs::Array{Float64, 2}, state::BitArray{2}, p::KTAMParams)
     totalprob = sum(probs)
     if totalprob == 0
         return CartesianIndex(-1, -1), Inf  # -1, -1 indicates no possible addition
@@ -382,7 +343,7 @@ function probabilistic_step!(concmult, dGatt, probs, state, p)
     dG = dGatt[loc]
     state[loc] = true
 
-    update_dGatt_and_probs_around!(concmult, dGatt, probs, state, loc, p)
+    update_dGatt_and_probs_around!(farray, dGatt, probs, state, loc, p)
 
     return loc, dG
 end
