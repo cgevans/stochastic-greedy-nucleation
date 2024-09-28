@@ -6,7 +6,6 @@ using StatsBase
 using Distributed
 using ImageFiltering
 import TinyClimbers
-import SHAM
 using DataStructures
 using Random
 using GroupSlices
