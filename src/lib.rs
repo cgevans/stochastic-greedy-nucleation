@@ -458,8 +458,10 @@ pub fn probabilistic_gce(
         }
     }
 
+
     GrowthResult {
         gce,
+        ncns: found_cns.len(),
         gcns: found_gcns,
         nucrate: nucrates.iter().sum(),
         nucrates,
@@ -467,7 +469,6 @@ pub fn probabilistic_gce(
         traces: found_traces,
         size_traces,
         stopped_pct: stopped_trials as f64 / trials as f64,
-        ncns: found_cns.len(),
         min_gcn_per_site,
         weight_gcn_per_site,
         min_size_per_site,
