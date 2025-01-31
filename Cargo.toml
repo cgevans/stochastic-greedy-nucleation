@@ -1,5 +1,5 @@
 [package]
-name = "two_step_nuc"
+name = "stochastic_greedy_model"
 version = "0.1.0"
 edition = "2021"
 
