@@ -1,0 +1,12 @@
+[package]
+name = "two_step_nuc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ndarray = "0.15"
+rand = "0.8"
+statrs = "0.16"  # For statistics functions
+ndarray-stats = "0.5"
+rayon = "1.7"    # For parallel processing
+image = "0.24"   # For image filtering operations
