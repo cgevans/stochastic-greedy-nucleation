@@ -1,16 +1,20 @@
 use ndarray::{Array2, ArrayView2, Axis};
-use numpy::{IntoPyArray, PyArray2};
-use pyo3::{prelude::*, types::PyDict};
 use rand::Rng;
 use std::f64;
 
+#[cfg(feature = "python")]
+use numpy::{IntoPyArray, PyArray2};
+#[cfg(feature = "python")]
+use pyo3::{prelude::*, types::PyDict};
+
+#[cfg(feature = "python")]
 #[pymodule]
 fn two_step_nuc(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_probabilistic_gce, m)?)?;
     Ok(())
 }
 
-
+#[cfg(feature = "python")]
 #[pyfunction]
 fn py_probabilistic_gce(
     py: Python<'_>,

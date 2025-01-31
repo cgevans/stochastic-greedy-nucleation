@@ -7,9 +7,12 @@ edition = "2021"
 name = "two_step_nuc"
 crate-type = ["cdylib"]
 
+[features]
+python = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
-pyo3 = { version = "0.19", features = ["extension-module"] }
-numpy = "0.19"
+pyo3 = { version = "0.19", features = ["extension-module"], optional = true }
+numpy = { version = "0.19", optional = true }
 ndarray = "0.15"
 rand = "0.8"
 statrs = "0.16"  # For statistics functions
