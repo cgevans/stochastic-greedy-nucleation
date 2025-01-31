@@ -66,9 +66,13 @@ pub const OFF5: [(i32, i32); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "python", derive(FromPyObject))]
 pub struct KTAMParams {
+    #[pyo3(get, set)]
     gmc: f64,
+    #[pyo3(get, set)]
     gse: f64,
+    #[pyo3(get, set)]
     alpha: f64,
+    #[pyo3(get, set)]
     kf: f64,
 }
 
