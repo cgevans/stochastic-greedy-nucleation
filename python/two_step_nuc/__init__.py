@@ -6,8 +6,8 @@ class KTAMParams:
         
         Args:
             gmc: Monomer concentration parameter
-            gse: Stacking energy parameter
-            alpha: Nucleation penalty parameter
+            gse: Bond energy parameter
+            alpha: kTAM alpha parameter
             kf: Forward rate constant
         """
         self.gmc = gmc
