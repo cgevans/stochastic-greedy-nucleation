@@ -1,6 +1,86 @@
 use ndarray::{Array2, ArrayView2, Axis};
+use numpy::{IntoPyArray, PyArray2};
+use pyo3::prelude::*;
 use rand::Rng;
 use std::f64;
+
+#[pymodule]
+fn two_step_nuc(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    m.add_class::<PyKTAMParams>()?;
+    m.add_function(wrap_pyfunction!(py_probabilistic_gce, m)?)?;
+    Ok(())
+}
+
+#[pyclass]
+#[derive(Clone)]
+struct PyKTAMParams {
+    #[pyo3(get, set)]
+    gmc: f64,
+    #[pyo3(get, set)]
+    gse: f64,
+    #[pyo3(get, set)]
+    alpha: f64,
+    #[pyo3(get, set)]
+    kf: f64,
+}
+
+#[pymethods]
+impl PyKTAMParams {
+    #[new]
+    fn new(gmc: f64, gse: f64, alpha: f64, kf: f64) -> Self {
+        Self { gmc, gse, alpha, kf }
+    }
+
+    fn to_ktam_params(&self) -> KTAMParams {
+        KTAMParams::new(self.gmc, self.gse, self.alpha, self.kf)
+    }
+}
+
+#[pyfunction]
+fn py_probabilistic_gce(
+    py: Python<'_>,
+    farray: &PyArray2<f64>,
+    trials: usize,
+    params: PyKTAMParams,
+    depth: usize,
+    calc_weightsize_g: bool,
+    store_assemblies: bool,
+) -> PyResult<PyObject> {
+    let farray = unsafe { farray.as_array() }.to_owned();
+    let params = params.to_ktam_params();
+    
+    let result = probabilistic_gce(
+        &farray,
+        trials,
+        &params,
+        depth,
+        calc_weightsize_g,
+        store_assemblies,
+    );
+
+    let dict = PyDict::new(py);
+    dict.set_item("gce", result.gce)?;
+    dict.set_item("gcns", result.gcns)?;
+    dict.set_item("nucrate", result.nucrate)?;
+    dict.set_item("nucrates", result.nucrates)?;
+    dict.set_item("traces", result.traces)?;
+    dict.set_item("size_traces", result.size_traces)?;
+    dict.set_item("stopped_pct", result.stopped_pct)?;
+    dict.set_item("ncns", result.ncns)?;
+    dict.set_item("min_gcn_per_site", result.min_gcn_per_site.into_pyarray(py))?;
+    dict.set_item("weight_gcn_per_site", result.weight_gcn_per_site.into_pyarray(py))?;
+    dict.set_item("min_size_per_site", result.min_size_per_site.into_pyarray(py))?;
+    dict.set_item("weight_size_per_site", result.weight_size_per_site.into_pyarray(py))?;
+    dict.set_item("nucrate_per_site", result.nucrate_per_site.into_pyarray(py))?;
+    dict.set_item("min_size", result.min_size)?;
+    dict.set_item("weight_size", result.weight_size)?;
+    dict.set_item("final_g", result.final_g)?;
+    dict.set_item("base_g", result.base_g)?;
+    dict.set_item("num_per_size", result.num_per_size)?;
+    dict.set_item("g_weighted_per_size", result.g_weighted_per_size)?;
+
+    Ok(dict.into())
+}
 
 pub const OFF4: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 pub const OFF5: [(i32, i32); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
