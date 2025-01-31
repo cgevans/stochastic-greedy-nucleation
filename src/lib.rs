@@ -1,53 +1,27 @@
 use ndarray::{Array2, ArrayView2, Axis};
 use numpy::{IntoPyArray, PyArray2};
-use pyo3::prelude::*;
+use pyo3::{prelude::*, types::PyDict};
 use rand::Rng;
 use std::f64;
 
 #[pymodule]
 fn two_step_nuc(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    m.add_class::<PyKTAMParams>()?;
     m.add_function(wrap_pyfunction!(py_probabilistic_gce, m)?)?;
     Ok(())
 }
 
-#[pyclass]
-#[derive(Clone)]
-struct PyKTAMParams {
-    #[pyo3(get, set)]
-    gmc: f64,
-    #[pyo3(get, set)]
-    gse: f64,
-    #[pyo3(get, set)]
-    alpha: f64,
-    #[pyo3(get, set)]
-    kf: f64,
-}
-
-#[pymethods]
-impl PyKTAMParams {
-    #[new]
-    fn new(gmc: f64, gse: f64, alpha: f64, kf: f64) -> Self {
-        Self { gmc, gse, alpha, kf }
-    }
-
-    fn to_ktam_params(&self) -> KTAMParams {
-        KTAMParams::new(self.gmc, self.gse, self.alpha, self.kf)
-    }
-}
 
 #[pyfunction]
 fn py_probabilistic_gce(
     py: Python<'_>,
     farray: &PyArray2<f64>,
     trials: usize,
-    params: PyKTAMParams,
+    params: KTAMParams,
     depth: usize,
     calc_weightsize_g: bool,
     store_assemblies: bool,
 ) -> PyResult<PyObject> {
     let farray = unsafe { farray.as_array() }.to_owned();
-    let params = params.to_ktam_params();
     
     let result = probabilistic_gce(
         &farray,
@@ -85,7 +59,7 @@ fn py_probabilistic_gce(
 pub const OFF4: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 pub const OFF5: [(i32, i32); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromPyObject)]
 pub struct KTAMParams {
     gmc: f64,
     gse: f64,
