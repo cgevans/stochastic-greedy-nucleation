@@ -63,7 +63,8 @@ fn py_probabilistic_gce(
 pub const OFF4: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 pub const OFF5: [(i32, i32); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
 
-#[derive(Clone, Debug, FromPyObject)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "python", derive(FromPyObject))]
 pub struct KTAMParams {
     gmc: f64,
     gse: f64,
