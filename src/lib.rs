@@ -279,6 +279,210 @@ fn update_dgatt_and_probs_around(
 }
 
 /// Fill in favorable sites and return total dG change, forward rate, and number of tiles added
+#[derive(Clone)]
+pub struct GrowthResult {
+    pub gce: f64,
+    pub gcns: Vec<f64>,
+    pub nucrate: f64,
+    pub nucrates: Vec<f64>,
+    pub cns: Vec<Array2<bool>>,
+    pub traces: Vec<Vec<f64>>,
+    pub size_traces: Vec<Vec<i64>>,
+    pub stopped_pct: f64,
+    pub ncns: usize,
+    pub min_gcn_per_site: Array2<f64>,
+    pub weight_gcn_per_site: Array2<f64>,
+    pub min_size_per_site: Array2<f64>,
+    pub weight_size_per_site: Array2<f64>,
+    pub nucrate_per_site: Array2<f64>,
+    pub min_size: usize,
+    pub weight_size: f64,
+    pub final_g: f64,
+    pub base_g: f64,
+    pub num_per_size: Vec<f64>,
+    pub g_weighted_per_size: Vec<f64>,
+    pub assembly_traces: Vec<Vec<Array2<bool>>>,
+}
+
+pub fn probabilistic_gce(
+    farray: &Array2<f64>,
+    trials: usize,
+    params: &KTAMParams,
+    depth: usize,
+    calc_weightsize_g: bool,
+    store_assemblies: bool,
+) -> GrowthResult {
+    let maxsize = farray.iter().filter(|&&x| x > 0.0).count();
+    
+    let mut found_cns = Vec::new();
+    let mut found_gcns = Vec::new();
+    let mut found_traces = Vec::new();
+    let mut size_traces = Vec::new();
+    let mut nucrates = Vec::new();
+    
+    let shape = farray.dim();
+    let mut min_gcn_per_site = Array2::from_elem(shape, f64::INFINITY);
+    let mut weight_gcn_per_site = Array2::from_elem(shape, f64::INFINITY);
+    let mut nucrate_per_site = Array2::from_elem(shape, f64::NAN);
+    let mut min_size_per_site = Array2::from_elem(shape, f64::INFINITY);
+    let mut weight_size_per_site = Array2::from_elem(shape, f64::INFINITY);
+    
+    let mut sized_assemblies = vec![Vec::new(); maxsize];
+    let mut sized_assembly_gs = vec![Vec::new(); maxsize];
+    let mut assembly_traces = Vec::new();
+
+    let mut stopped_trials = 0;
+    let mut good_trials = 0;
+    let mut finished_trials = 0;
+
+    // Find the final G
+    let final_g = calculate_g(farray, &Array2::from_elem(shape, true), params);
+    let base_g = params.g_mc() - params.alpha();
+
+    while finished_trials < trials {
+        // Choose starting site probabilistically based on concentration
+        let starting_site = choose_position(farray);
+        
+        // Get trajectory from that site
+        let out = probable_trajectory(
+            farray,
+            starting_site,
+            params,
+            depth,
+            store_assemblies,
+        );
+
+        finished_trials += 1;
+
+        // Store sized assemblies if requested
+        if calc_weightsize_g {
+            for (k, assembly) in out.assemblies.iter().enumerate() {
+                if !sized_assemblies[k].contains(assembly) {
+                    sized_assemblies[k].push(assembly.clone());
+                    sized_assembly_gs[k].push(out.g_trace[k]);
+                }
+            }
+        }
+
+        found_gcns.push(out.gcn);
+        found_cns.push(out.cn);
+        found_traces.push(out.g_trace);
+        nucrates.push(out.nucrate);
+        size_traces.push(out.size_trace);
+        if store_assemblies {
+            assembly_traces.push(out.assemblies);
+        }
+        good_trials += 1;
+    }
+
+    // Calculate Gce
+    let gce = if found_gcns.is_empty() {
+        f64::INFINITY
+    } else {
+        -(-found_gcns.iter().sum::<f64>()).exp().ln()
+    };
+
+    // Calculate per-site statistics
+    for (i, cn) in found_cns.iter().enumerate() {
+        for (idx, &is_present) in cn.indexed_iter() {
+            if !is_present {
+                continue;
+            }
+            
+            let gcn = found_gcns[i];
+            let exp_neg_gcn = (-gcn).exp();
+            
+            min_gcn_per_site[idx] = min_gcn_per_site[idx].min(gcn);
+            weight_gcn_per_site[idx] = if weight_gcn_per_site[idx].is_infinite() {
+                gcn
+            } else {
+                (weight_gcn_per_site[idx] + gcn * exp_neg_gcn) / (1.0 + exp_neg_gcn)
+            };
+            
+            let size = calculate_n(cn);
+            min_size_per_site[idx] = min_size_per_site[idx].min(size as f64);
+            weight_size_per_site[idx] = if weight_size_per_site[idx].is_infinite() {
+                size as f64
+            } else {
+                (weight_size_per_site[idx] + (size as f64) * exp_neg_gcn) / (1.0 + exp_neg_gcn)
+            };
+            
+            nucrate_per_site[idx] = if nucrate_per_site[idx].is_nan() {
+                nucrates[i] / (size as f64)
+            } else {
+                nucrate_per_site[idx] + nucrates[i] / (size as f64)
+            };
+        }
+    }
+
+    // Calculate size statistics
+    let min_size = found_cns.iter()
+        .map(|cn| calculate_n(cn))
+        .min()
+        .unwrap_or(0);
+        
+    let weight_size = if found_gcns.is_empty() {
+        0.0
+    } else {
+        let sizes: Vec<f64> = found_cns.iter()
+            .map(|cn| calculate_n(cn) as f64)
+            .collect();
+        let exp_neg_gcns: Vec<f64> = found_gcns.iter()
+            .map(|&g| (-g).exp())
+            .collect();
+        let total_exp = exp_neg_gcns.iter().sum::<f64>();
+        
+        sizes.iter()
+            .zip(exp_neg_gcns.iter())
+            .map(|(&s, &e)| s * e)
+            .sum::<f64>() / total_exp
+    };
+
+    // Calculate per-size statistics
+    let mut num_per_size = vec![0.0; maxsize];
+    let mut g_weighted_per_size = vec![0.0; maxsize];
+    
+    for (i, size) in size_traces.iter().enumerate() {
+        for (&s, &g) in size.iter().zip(found_traces[i].iter()) {
+            let idx = (s as usize) - 1;
+            if idx < maxsize {
+                num_per_size[idx] += 1.0;
+                g_weighted_per_size[idx] += g;
+            }
+        }
+    }
+    
+    for i in 0..maxsize {
+        if num_per_size[i] > 0.0 {
+            g_weighted_per_size[i] /= num_per_size[i];
+        }
+    }
+
+    GrowthResult {
+        gce,
+        gcns: found_gcns,
+        nucrate: nucrates.iter().sum(),
+        nucrates,
+        cns: found_cns,
+        traces: found_traces,
+        size_traces,
+        stopped_pct: stopped_trials as f64 / trials as f64,
+        ncns: found_cns.len(),
+        min_gcn_per_site,
+        weight_gcn_per_site,
+        min_size_per_site,
+        weight_size_per_site,
+        nucrate_per_site,
+        min_size,
+        weight_size,
+        final_g,
+        base_g,
+        num_per_size,
+        g_weighted_per_size,
+        assembly_traces,
+    }
+}
+
 fn fill_favorable(
     concmult: &Array2<f64>,
     dgatt: &mut Array2<f64>,
