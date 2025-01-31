@@ -1,3 +1,10 @@
-**/.ipynb_checkpoints/*
-*~
-src/.vscode/settings.json
+target/
+*.so
+.aider*
+Cargo.lock
+build/
+*.pyc
+*.dll
+*.dylib
+.vscode
+.ipynb_checkpoints

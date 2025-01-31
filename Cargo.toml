@@ -1,21 +1,21 @@
 [package]
 name = "stochastic_greedy_model"
+authors = ["Constantine Evans <constantine@costi.net>"]
+description = "An implementation of the stochastic greedy model of nucleation, and related models"
+license = "BSD-3-Clause"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "two_step_nuc"
+name = "stochastic_greedy_model"
 crate-type = ["cdylib"]
 
 [features]
 python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
-pyo3 = { version = "0.19", features = ["extension-module"], optional = true }
-numpy = { version = "0.19", optional = true }
-ndarray = "0.15"
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+numpy = { version = "0.23", optional = true }
+ndarray = "0.16"
 rand = "0.8"
-statrs = "0.16"  # For statistics functions
-ndarray-stats = "0.5"
-rayon = "1.7"    # For parallel processing
-image = "0.24"   # For image filtering operations
+approx = "0.5.1"
