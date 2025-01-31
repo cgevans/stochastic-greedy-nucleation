@@ -277,3 +277,80 @@ fn update_dgatt_and_probs_around(
         }
     }
 }
+
+/// Fill in favorable sites and return total dG change, forward rate, and number of tiles added
+fn fill_favorable(
+    concmult: &Array2<f64>,
+    dgatt: &mut Array2<f64>,
+    probs: &mut Array2<f64>,
+    state: &mut Array2<bool>,
+    loc: (usize, usize),
+    params: &KTAMParams,
+    is_current_critnuc: bool,
+) -> (f64, f64, usize) {
+    let mut total_dg = 0.0;
+    let mut ntiles = 0;
+    
+    // Calculate forward rate if this is current critical nucleus
+    let mut frate = 0.0;
+    if is_current_critnuc {
+        for &(dx, dy) in OFF4.iter() {
+            let new_x = loc.0 as i32 + dx;
+            let new_y = loc.1 as i32 + dy;
+            
+            let (rows, cols) = state.dim();
+            if new_x < 0 || new_x >= rows as i32 || new_y < 0 || new_y >= cols as i32 {
+                continue;
+            }
+            
+            let trial_site = (new_x as usize, new_y as usize);
+            if dgatt[[trial_site.0, trial_site.1]] < 0.0 {
+                frate += params.k_f() * (-params.g_mc() + params.alpha()).exp();
+            }
+        }
+    }
+
+    // Keep filling until no more favorable sites
+    loop {
+        let mut did_something = false;
+        
+        // Check sites adjacent to previous attachments
+        for &(dx, dy) in OFF4.iter() {
+            let new_x = loc.0 as i32 + dx;
+            let new_y = loc.1 as i32 + dy;
+            
+            let (rows, cols) = state.dim();
+            if new_x < 0 || new_x >= rows as i32 || new_y < 0 || new_y >= cols as i32 {
+                continue;
+            }
+            
+            let trial_site = (new_x as usize, new_y as usize);
+            let dg = dgatt[[trial_site.0, trial_site.1]];
+            
+            // Found a favorable site (dG < 0)
+            if dg < 0.0 {
+                state[[trial_site.0, trial_site.1]] = true;
+                ntiles += 1;
+                total_dg += dg;
+                
+                update_dgatt_and_probs_around(
+                    concmult,
+                    dgatt,
+                    probs,
+                    state,
+                    trial_site,
+                    params
+                );
+                
+                did_something = true;
+                break;
+            }
+        }
+        
+        if !did_something {
+            break;
+        }
+    }
+
+    (total_dg, frate, ntiles)
+}
