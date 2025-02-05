@@ -8,10 +8,11 @@ edition = "2021"
 
 [lib]
 name = "stochastic_greedy_model"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 python = ["dep:pyo3", "dep:numpy"]
+default = ["python"]
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
@@ -19,3 +20,18 @@ numpy = { version = "0.23", optional = true }
 ndarray = "0.16"
 rand = "0.8"
 approx = "0.5.1"
+ndarray-stats = "0.6.0"
+itertools = "0.14.0"
+logaddexp = "0.1.3"
+num-traits = "0.2.19"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "counting"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1

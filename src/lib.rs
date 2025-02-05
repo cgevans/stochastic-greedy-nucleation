@@ -1,18 +1,27 @@
-use ndarray::{Array2, ArrayView2, Axis};
+#![feature(f128)]
+use ndarray::{Array2, ArrayView2};
 use rand::Rng;
-use std::f64;
-
+use std::{
+    collections::{HashMap, HashSet},
+    f64::{self, INFINITY},
+};
+use logaddexp::LogSumExp;
+use num_traits::{Float,FloatConst};
+use itertools::iproduct;
 #[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 #[cfg(feature = "python")]
 use pyo3::{prelude::*, types::PyDict};
 
 #[cfg(feature = "python")]
 #[pymodule]
-fn stochastic_greedy_model(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn stochastic_greedy_model<'py>(_py: Python<'py>, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_probabilistic_gce, m)?)?;
     m.add_function(wrap_pyfunction!(py_window_nuc_rate, m)?)?;
+    m.add_function(wrap_pyfunction!(py_window_nuc_rate_k, m)?)?;
     m.add_function(wrap_pyfunction!(py_window_score, m)?)?;
+    m.add_function(wrap_pyfunction!(py_window_k_array_with_bonds, m)?)?;
+    m.add_function(wrap_pyfunction!(py_window_path_nuc_rate, m)?)?;
     Ok(())
 }
 
@@ -20,17 +29,15 @@ fn stochastic_greedy_model(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
 #[pyfunction(name = "probabilistic_gce")]
 fn py_probabilistic_gce(
     py: Python<'_>,
-    farray: &PyArray2<f64>,
+    farray: PyReadonlyArray2<f64>,
     trials: usize,
     params: KTAMParams,
     depth: usize,
     calc_weightsize_g: bool,
     store_assemblies: bool,
 ) -> PyResult<PyObject> {
-    let farray = unsafe { farray.as_array() }.to_owned();
-
     let result = probabilistic_gce(
-        &farray,
+        farray.as_array(),
         trials,
         &params,
         depth,
@@ -71,12 +78,31 @@ fn py_probabilistic_gce(
     Ok(dict.into())
 }
 
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "window_nuc_rate_k")]
+fn py_window_nuc_rate_k(
+    concarray: PyReadonlyArray2<f64>,
+    gse: f64,
+    alpha: f64,
+    base: f64,
+    kf: f64,
+    k: usize
+) -> PyResult<f64> {
+    Ok(window_nuc_k(
+        concarray.as_array(),
+        k,
+        gse,
+        alpha,
+        base,
+        kf,
+    ))
+}
+
 #[cfg(feature = "python")]
 #[pyfunction(name = "window_nuc_rate")]
 fn py_window_nuc_rate(
-    pattern: Vec<(usize, usize)>,
-    base: f64,
-    m: f64,
+    concarray: PyReadonlyArray2<f64>,
     gse: f64,
     alpha: f64,
     kf: f64,
@@ -84,9 +110,7 @@ fn py_window_nuc_rate(
     k_max: usize,
 ) -> PyResult<f64> {
     Ok(window_nuc_rate(
-        &pattern,
-        base,
-        m,
+        concarray.as_array(),
         gse,
         alpha,
         kf,
@@ -96,9 +120,44 @@ fn py_window_nuc_rate(
 
 #[cfg(feature = "python")]
 #[pyfunction(name = "window_score")]
-fn py_window_score(py: Python<'_>, z: &PyArray2<f64>, k: usize) -> PyResult<f64> {
-    let z_array = unsafe { z.as_array() }.to_owned();
-    Ok(window_score(&z_array, k))
+fn py_window_score(_py: Python<'_>, z: PyReadonlyArray2<f64>, k: usize) -> PyResult<f64> {
+    Ok(window_score(z.as_array(), k))
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "window_k_array_with_bonds")]
+fn py_window_k_array_with_bonds<'py>(
+    py: Python<'py>,
+    conc_array: PyReadonlyArray2<f64>,
+    gse_to_e: PyReadonlyArray2<f64>,
+    gse_to_s: PyReadonlyArray2<f64>,
+    k: usize,
+) -> Bound<'py, PyArray2<f64>> {
+    let result = window_k_array_with_bonds(
+        conc_array.as_array(),
+        gse_to_e.as_array(),
+        gse_to_s.as_array(),
+        k,
+    );
+    result.into_pyarray(py)
+}
+
+#[cfg(feature = "python")]
+#[pyfunction(name = "window_path_nuc_rate")]
+fn py_window_path_nuc_rate(
+    concarray: PyReadonlyArray2<f64>,
+    gse: f64,
+    alpha: f64,
+    kf: f64,
+    include_size_in_forward: bool,
+) -> PyResult<f64> {
+    Ok(window_path_nuc_rate(
+        concarray.as_array(),
+        gse,
+        alpha,
+        kf,
+        include_size_in_forward,
+    ))
 }
 
 pub const OFF4: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
@@ -156,10 +215,10 @@ pub struct TrajectoryResult {
 }
 
 // Helper function to choose position based on weights
-fn choose_position(weights: &Array2<f64>) -> (usize, usize) {
+fn choose_position(weights: ArrayView2<f64>) -> (usize, usize) {
     let mut rng = rand::thread_rng();
     let total = weights.sum();
-    let mut trigger = total * rng.gen::<f64>();
+    let trigger = total * rng.gen::<f64>();
     let mut accum = 0.0;
 
     for (idx, &weight) in weights.indexed_iter() {
@@ -175,11 +234,17 @@ fn choose_position(weights: &Array2<f64>) -> (usize, usize) {
 }
 
 // Core functions for calculating properties
-fn calculate_n(state: &Array2<bool>) -> usize {
+pub fn calculate_n(state: ArrayView2<bool>) -> usize {
     state.iter().filter(|&&x| x).count()
 }
 
-fn calculate_b(state: &Array2<bool>) -> usize {
+pub fn calculate_n_add(state: ArrayView2<bool>) -> usize {
+    let mut n = 0;
+    state.iter().for_each(|&x| n += x as usize);
+    n
+}
+
+fn calculate_b(state: ArrayView2<bool>) -> usize {
     let (rows, cols) = state.dim();
     let mut bonds = 0;
 
@@ -204,7 +269,7 @@ fn calculate_b(state: &Array2<bool>) -> usize {
     bonds
 }
 
-fn calculate_g(conc_mult: &Array2<f64>, state: &Array2<bool>, params: &KTAMParams) -> f64 {
+fn calculate_g(conc_mult: ArrayView2<f64>, state: ArrayView2<bool>, params: &KTAMParams) -> f64 {
     let n = calculate_n(state) as f64;
     let b = calculate_b(state) as f64;
     let log_sum: f64 = state
@@ -219,7 +284,7 @@ fn calculate_g(conc_mult: &Array2<f64>, state: &Array2<bool>, params: &KTAMParam
 
 /// Calculate a single SGM trajectory
 pub fn probable_trajectory(
-    farray: &Array2<f64>,
+    farray: ArrayView2<f64>,
     starting_site: (usize, usize),
     params: &KTAMParams,
     max_steps: usize,
@@ -267,7 +332,7 @@ pub fn probable_trajectory(
         farray,
         &mut dgatt,
         &mut probs,
-        &state,
+        state.view(),
         starting_site,
         params,
     );
@@ -329,7 +394,7 @@ pub fn probable_trajectory(
 }
 
 fn probabilistic_step(
-    farray: &Array2<f64>,
+    farray: ArrayView2<f64>,
     dgatt: &mut Array2<f64>,
     probs: &mut Array2<f64>,
     state: &mut Array2<bool>,
@@ -340,20 +405,20 @@ fn probabilistic_step(
         return None;
     }
 
-    let loc = choose_position(probs);
+    let loc = choose_position(probs.view());
     let dg = dgatt[[loc.0, loc.1]];
     state[[loc.0, loc.1]] = true;
 
-    update_dgatt_and_probs_around(farray, dgatt, probs, state, loc, params);
+    update_dgatt_and_probs_around(farray, dgatt, probs, state.view(), loc, params);
 
     Some((loc, dg))
 }
 
 fn update_dgatt_and_probs_around(
-    concmult: &Array2<f64>,
+    concmult: ArrayView2<f64>,
     dgatt: &mut Array2<f64>,
     probs: &mut Array2<f64>,
-    state: &Array2<bool>,
+    state: ArrayView2<bool>,
     loc: (usize, usize),
     params: &KTAMParams,
 ) {
@@ -428,7 +493,7 @@ pub struct GrowthResult {
 }
 
 pub fn probabilistic_gce(
-    farray: &Array2<f64>,
+    farray: ArrayView2<f64>,
     trials: usize,
     params: &KTAMParams,
     depth: usize,
@@ -454,12 +519,12 @@ pub fn probabilistic_gce(
     let mut sized_assembly_gs = vec![Vec::new(); maxsize];
     let mut assembly_traces = Vec::new();
 
-    let mut stopped_trials = 0;
+    let stopped_trials = 0;
     let mut good_trials = 0;
     let mut finished_trials = 0;
 
     // Find the final G
-    let final_g = calculate_g(farray, &farray.map(|&x| x > 0.0), params);
+    let final_g = calculate_g(farray, farray.map(|&x| x > 0.0).view(), params);
     let base_g = params.g_mc() - params.alpha();
 
     while finished_trials < trials {
@@ -548,7 +613,7 @@ pub fn probabilistic_gce(
                 (weight_gcn_per_site[idx] + gcn * exp_neg_gcn) / (1.0 + exp_neg_gcn)
             };
 
-            let size = calculate_n(cn);
+            let size = calculate_n(cn.view());
             min_size_per_site[idx] = min_size_per_site[idx].min(size as f64);
             weight_size_per_site[idx] = if weight_size_per_site[idx].is_infinite() {
                 size as f64
@@ -567,14 +632,17 @@ pub fn probabilistic_gce(
     // Calculate size statistics
     let min_size = found_cns
         .iter()
-        .map(|cn| calculate_n(cn))
+        .map(|cn| calculate_n(cn.view()))
         .min()
         .unwrap_or(0);
 
     let weight_size = if found_gcns.is_empty() {
         0.0
     } else {
-        let sizes: Vec<f64> = found_cns.iter().map(|cn| calculate_n(cn) as f64).collect();
+        let sizes: Vec<f64> = found_cns
+            .iter()
+            .map(|cn| calculate_n(cn.view()) as f64)
+            .collect();
         let exp_neg_gcns: Vec<f64> = found_gcns.iter().map(|&g| (-g).exp()).collect();
         let total_exp = exp_neg_gcns.iter().sum::<f64>();
 
@@ -632,7 +700,7 @@ pub fn probabilistic_gce(
 }
 
 fn fill_favorable(
-    concmult: &Array2<f64>,
+    concmult: ArrayView2<f64>,
     dgatt: &mut Array2<f64>,
     probs: &mut Array2<f64>,
     state: &mut Array2<bool>,
@@ -685,7 +753,14 @@ fn fill_favorable(
                 ntiles += 1;
                 total_dg += dg;
 
-                update_dgatt_and_probs_around(concmult, dgatt, probs, state, trial_site, params);
+                update_dgatt_and_probs_around(
+                    concmult,
+                    dgatt,
+                    probs,
+                    state.view(),
+                    trial_site,
+                    params,
+                );
 
                 did_something = true;
                 break;
@@ -705,132 +780,266 @@ use ndarray::s;
 /// The "Window Score"
 /// This is essentially the log of the sum of the product of concentrations
 /// in k x k squares, or "windows".
-fn window_score(conc_array: &Array2<f64>, k: usize) -> f64 {
-    let log_z = conc_array.mapv(|x| x.ln());
+pub fn window_score(conc_array: ArrayView2<f64>, k: usize) -> f64 {
+    let log_z = conc_array.mapv(|x| (x as f64).ln());
 
-    let mut convolved = Array2::zeros((conc_array.dim().0 - k + 1, conc_array.dim().1 - k + 1));
+    let mut convolved = Array2::from_elem((conc_array.dim().0 - k + 1, conc_array.dim().1 - k + 1), 0.0);
 
     convolved
         .indexed_iter_mut()
-        .for_each(|((i, j), x)| *x = log_z.slice(s![i..i + k, j..j + k]).sum().exp());
+        .for_each(|((i, j), x)| *x = log_z.slice(s![i..i + k, j..j + k]).fold(0.0, |a, &b| a + b));
 
-    convolved.sum().ln()
+    let v: Vec<_> = convolved.into_iter().collect();
+    v.into_iter().ln_sum_exp()
 }
 
 /// The "Window Score"
 /// This is essentially the log of the sum of the product of concentrations
 /// in k x k squares, or "windows".
-fn window_score_with_bonds(
-    conc_array: &Array2<f64>,
-    gse_to_e: &Array2<f64>,
-    gse_to_s: &Array2<f64>,
+pub fn window_k_array_with_bonds(
+    conc_array: ArrayView2<f64>,
+    gse_to_e: ArrayView2<f64>,
+    gse_to_s: ArrayView2<f64>,
     k: usize,
-) -> f64 {
-    let log_z = conc_array.mapv(|x| x.ln());
-
+) -> Array2<f64> {
     // Check dimensions of gse arrays match conc_array
     let (rows, cols) = conc_array.dim();
     assert!(
-        (gse_to_e.dim() == (rows, cols) || gse_to_e.dim() == (rows-1, cols-1)) &&
-        (gse_to_s.dim() == (rows, cols) || gse_to_s.dim() == (rows-1, cols-1)),
+        (gse_to_e.dim() == (rows, cols) || gse_to_e.dim() == (rows - 1, cols - 1))
+            && (gse_to_s.dim() == (rows, cols) || gse_to_s.dim() == (rows - 1, cols - 1)),
         "gse arrays must be same size as conc_array or 1 smaller in each dimension"
     );
 
-    let mut convolved = Array2::<f64>::zeros((conc_array.dim().0 - k + 1, conc_array.dim().1 - k + 1));
+    let mut convolved = Array2::<f64>::from_elem(
+        (conc_array.dim().0 - k + 1, conc_array.dim().1 - k + 1),
+        INFINITY,
+    );
+
+    convolved.indexed_iter_mut().for_each(|((i, j), x)| {
+        let mut first = true;
+        let mut b = 0;
+        conc_array
+            .slice(s![i..i + k, j..j + k])
+            .indexed_iter()
+            .for_each(|((ii, jj), z)| {
+                if *z > 0.0 {
+                    if first {
+                        first = false;
+                        *x = 0.0;
+                    }
+                    let mut v = -(z.ln());
+                    if (ii < k - 1) && (conc_array[[i + ii + 1, j + jj]] > 0.0) {
+                        v -= gse_to_s[[i + ii, j + jj]];
+                    };
+                    if (jj < k - 1) && (conc_array[[i + ii, j + jj + 1]] > 0.0) {
+                        v -= gse_to_e[[i + ii, j + jj]];
+                    };
+                    *x += v;
+                }
+            });
+    });
 
     convolved
-        .indexed_iter_mut()
-        .for_each(|((i, j), x)| {
-            log_z.slice(s![i..i + k, j..j + k]).indexed_iter().for_each(|((ii, jj), z)| {
-                let mut v = *z;
-                if (i < k) {v *= (-gse_to_s[[i+ii, j+jj]]).exp()};
-                if (j < k) {v *= (-gse_to_e[[i+ii, j+jj]]).exp()};
-                *x += v;
-            });
-            *x = (*x).exp();
-        });
-
-    convolved.sum().ln()
 }
 
-fn window_score_pat(pat: &[(usize, usize)], m: f64, base: f64, k: usize) -> f64 {
-    let mut z = Array2::from_elem((16, 16), base);
-    for &(x, y) in pat {
-        z[[x + 5, y + 5]] = m * base;
-    }
-    window_score(&z, k)
-}
+// pub fn window_score_pat(pat: &[(usize, usize)], m: f64, base: f64, k: usize) -> f64 {
+//     let mut z = Array2::from_elem((16, 16), base);
+//     for &(x, y) in pat {
+//         z[[x + 5, y + 5]] = m * base;
+//     }
+//     window_score(z.view(), k)
+// }
 
-fn window_nuc_k(
-    pat: &[(usize, usize)],
-    k: usize,
-    base: f64,
-    m: f64,
-    gse: f64,
-    alpha: f64,
-    kf: f64,
-) -> f64 {
+pub fn window_nuc_k(z: ArrayView2<f64>, k: usize, gse: f64, alpha: f64, base: f64, kf: f64) -> f64 {
     let b = 2 * k * (k - 1);
     let p = 4 * k;
 
-    let score = window_score_pat(pat, m, base, k);
-    kf * (p as f64) * base * score.exp() * (b as f64 * gse - (k * k) as f64 * alpha).exp()
+    let score = window_score(z, k);
+    kf * (p as f64) * base * (score + ((b as f64) * gse) - (((k * k) - 1) as f64 * alpha)).exp()
 }
 
-fn window_nuc_rate(
-    pat: &[(usize, usize)],
-    base: f64,
-    m: f64,
+pub fn window_nuc_rate(
+    z: ArrayView2<f64>,
     gse: f64,
     alpha: f64,
     kf: f64,
     krange: std::ops::Range<usize>,
 ) -> f64 {
+    // use median of nonzero z values as base
+    let mut b = z.iter().filter(|&&x| x > 0.0).cloned().collect::<Vec<_>>();
+    b.sort_unstable_by(move |&i, &j| i.partial_cmp(&j).unwrap());
+    let base = b[b.len() / 2];
+
     krange
-        .map(|k| window_nuc_k(pat, k, base, m, gse, alpha, kf))
+        .map(|k| window_nuc_k(z, k, gse, alpha, base, kf))
         .fold(f64::INFINITY, |a, b| a.min(b))
+}
+
+pub fn window_path_nuc_rate(concarray: ArrayView2<f64>, gse: f64, alpha: f64, kf: f64, include_size_in_forward: bool) -> f64 {
+    // use median of nonzero z values as base
+    let mut b = concarray.iter().filter(|&&x| x > 0.0).cloned().collect::<Vec<_>>();
+    b.sort_unstable_by(move |&i, &j| i.partial_cmp(&j).unwrap());
+    let base = b[b.len() / 2];
+
+    let z = concarray.map(|x| x * (-alpha).exp());
+
+
+
+    let bondarray = Array2::from_elem(z.dim(), gse);
+    let window_arrays = (1..=(z.dim().0))
+        .map(|x| window_k_array_with_bonds(z.view(), bondarray.view(), bondarray.view(), x));
+    // Generate with pruning
+    let window_arrays: Vec<_> = window_arrays.collect();
+    let maxs: Vec<_> = window_arrays
+        .iter()
+        .map(|v| v.fold(f64::NEG_INFINITY, |a, &b| a.max(b)))
+        .collect();
+    let mins: Vec<_> = window_arrays
+        .iter()
+        .map(|v| v.fold(f64::INFINITY, |a, &b| a.min(b)))
+        .collect();
+
+    let mut startk = 0;
+    let mut stopk = window_arrays.len() - 1;
+
+    while maxs[startk..stopk]
+        .iter()
+        .zip(mins[startk + 1..].iter())
+        .any(|(&m1, &m2)| m1 < m2)
+    {
+        startk += 1;
+    }
+    while mins[startk..stopk - 1]
+        .iter()
+        .zip(maxs[startk + 1..].iter())
+        .any(|(&m1, &m2)| m1 > m2)
+    {
+        stopk -= 1;
+    }
+
+    let mut paths: Vec<(Vec<(usize, usize)>, f64)> = iproduct!(
+        0..window_arrays[stopk].dim().0,
+        0..window_arrays[stopk].dim().1
+    )
+    .map(|(i, j)| (vec![(i, j)], window_arrays[stopk][[i, j]]))
+    .collect();
+
+    for k in (startk..stopk).rev() {
+        let mut newpaths = Vec::new();
+        let mut newends = HashMap::new();
+
+        for path in paths {
+            let (i, j) = path.0[0];
+            for (di, dj) in [(0, 1), (1, 0), (1, 1), (0, 0)].iter() {
+                let m = window_arrays[k][[i + di, j + dj]];
+                if m > path.1 {
+                    newends.insert((i + di, j + dj), m);
+                } else {
+                    let mut new_path = vec![(i + di, j + dj)];
+                    new_path.extend(path.0.iter());
+                    newpaths.push((new_path, path.1));
+                }
+            }
+        }
+
+        paths = newends
+            .into_iter()
+            .map(|((i, j), m)| (vec![(i, j)], m))
+            .chain(newpaths)
+            .collect();
+    }
+
+
+    // Convert paths into arrays of values along each path
+    let pathvals: Vec<Vec<f64>> = paths
+        .iter()
+        .map(|(path, _)| {
+            path.iter()
+                .enumerate()
+                .map(|(k, &(i, j))| window_arrays[k + startk][[i, j]])
+                .collect()
+        })
+        .collect();
+
+    // Find index of maximum value in each path
+    let pathcritsize: Vec<usize> = pathvals
+        .iter()
+        .map(|vals| {
+            vals.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        })
+        .collect();
+
+    // Create critical points from indices and paths
+    let pathcrits: Vec<(usize, (usize, usize))> = pathcritsize
+        .iter()
+        .zip(paths.iter())
+        .map(|(&k, (path, _))| (k + startk, path[k]))
+        .collect();
+
+    // Create array of zeros for each window size
+    let mut iscrit: Vec<Array2<f64>> = window_arrays
+        .iter()
+        .map(|arr| Array2::zeros(arr.dim()))
+        .collect();
+
+    // Mark critical points
+    for (k, (i, j)) in pathcrits {
+        iscrit[k][[i, j]] = 1.0;
+    }
+
+    let mut nucrate = 0.0;
+    // sum(np.sum(np.exp(-v+alpha) * ic * kf * np.exp(-gmc+alpha)) for v, ic in zip(vv, iscrit))
+
+    let mut firstprint = true;
+
+    window_arrays.iter().zip(iscrit.iter()).enumerate().for_each(|(k, (v, ic))| {
+        ndarray::Zip::from(v).and(ic).for_each(|v, ic| {
+            let c = ((-v + alpha) as  f128).exp() * (*ic as f128) * kf as f128 * base as f128 * (if include_size_in_forward { 4.0*(k+1) as f128 } else { 1.0 });
+            let c = c as f64;
+            nucrate += c;
+        });
+    });
+
+    nucrate
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use num_traits::ToPrimitive;
 
     #[test]
     fn test_window_score() {
         // Test 1: k x k array of ones
         let k = 3;
         let ones = Array2::ones((k, k));
-        assert_relative_eq!(window_score(&ones, k), 0.0, epsilon = 1e-10);
+        assert_relative_eq!(window_score(ones.view(), k), 0.0, epsilon = 1e-10);
 
         // Test 2: k x k square of ones in larger array
         let mut larger = Array2::zeros((5, 5));
         larger.slice_mut(s![1..4, 1..4]).fill(1.0);
-        assert_relative_eq!(window_score(&larger, k), 0.0, epsilon = 1e-10);
+        assert_relative_eq!(window_score(larger.view(), k), 0.0, epsilon = 1e-10);
 
         // Test 3: k x k array of value X
         let x: f64 = 2.0;
         let x_array = Array2::from_elem((k, k), x);
         let expected = (k * k) as f64 * x.ln();
-        assert_relative_eq!(window_score(&x_array, k), expected, epsilon = 1e-10);
+        assert_relative_eq!(window_score(x_array.view(), k), expected, epsilon = 1e-10);
     }
 
+    // Given an N x N array of V, the window score with size k will be ln((N-k+1)^2 * v^k)
     #[test]
-    fn test_window_scores_equal_with_zero_bonds() {
-        let k = 3;
-        let size = 5;
-        
-        // Create random test array
-        let mut rng = rand::thread_rng();
-        let z = Array2::from_shape_fn((size, size), |_| rng.gen_range(0.0..10.0));
-        
-        // Create zero bond arrays
-        let gse_to_e = Array2::zeros((size, size));
-        let gse_to_s = Array2::zeros((size, size));
-        
-        let score1 = window_score(&z, k);
-        let score2 = window_score_with_bonds(&z, &gse_to_e, &gse_to_s, k);
-        
-        assert_relative_eq!(score1, score2, epsilon = 1e-10);
+    fn test_window_score_2() {
+        let n: usize = 20;
+        let k = 5;
+        let v = 1e-7;
+        let expected = (k as f64).powi(2) * v.ln() + 2.0 * ((n - k + 1) as f64).ln();
+        let mut array = Array2::from_elem((n, n), v);
+        assert_relative_eq!(window_score(array.view(), k), expected, epsilon = 1e-10);
     }
 }
